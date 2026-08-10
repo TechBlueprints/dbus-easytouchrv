@@ -154,8 +154,16 @@ RECONNECT_BASE_DELAY = 30      # seconds
 RECONNECT_MAX_DELAY = 900      # 15 minutes
 
 # Control writes are coalesced for this long before one BLE session
-# applies them all (mirrors the vendor app's behaviour).
+# applies them all (mirrors the vendor app's behaviour).  The timer
+# restarts on each write, so a burst collapses into one message.
 CHANGE_COALESCE_MS = 1000
+
+# Floor on the interval between dispatches for one device.  A slow drag
+# pauses for more than the coalescing window repeatedly, which would each
+# time flush another BLE write; this caps that to one dispatch per window
+# (always carrying the latest values) without adding latency to a single
+# tap, whose previous dispatch is long past.
+MIN_DISPATCH_INTERVAL_MS = 3000
 
 # Temperature-sensor connection status codes.
 SENSOR_OK = 0
@@ -342,6 +350,10 @@ class ThermostatDevice:
         self._pending: dict[str, int] = {}
         self._pending_timer: int | None = None
         self._inflight = 0
+        # None means "never dispatched" -- distinct from "dispatched at
+        # monotonic time 0", which would rate-limit the very first change
+        # (time.monotonic()'s epoch is arbitrary and can be near zero).
+        self._last_dispatch_ms: float | None = None
 
         # Switchable-output bookkeeping, populated once config is known.
         self._outputs_created = False
@@ -664,8 +676,21 @@ class ThermostatDevice:
         self._pending_timer = None
         if not self._pending:
             return False
+
+        # Rate-limit dispatches: if the previous one was recent (a drag in
+        # progress), wait out the remainder and send the latest values then.
+        now_ms = time.monotonic() * 1000.0
+        if self._last_dispatch_ms is not None:
+            wait_ms = int(MIN_DISPATCH_INTERVAL_MS
+                          - (now_ms - self._last_dispatch_ms))
+            if wait_ms > 0:
+                self._pending_timer = GLib.timeout_add(
+                    wait_ms, self._flush_changes)
+                return False
+
         changes = dict(self._pending)
         self._pending.clear()
+        self._last_dispatch_ms = now_ms
         self._inflight += 1
         self.manager.enqueue_change(self, changes)
         return False

@@ -766,5 +766,64 @@ class FreezeInputTests(unittest.TestCase):
         dev.apply_status(make_status(fault=5))           # must not blow up
 
 
+
+
+class DispatchRateLimitTests(unittest.TestCase):
+    """A slow drag must not produce one BLE write per pause."""
+
+    def setUp(self):
+        _timers.clear()
+        self.mgr = FakeManager()
+        self.dev = driver.ThermostatDevice(
+            self.mgr, "AA:BB:CC:DD:EE:FF", "AC Front", 0, "", 150)
+        self.dev.apply_config(make_config())
+        self.dev.apply_status(make_status())
+        self.mgr.dispatched.clear()
+
+    def fire(self):
+        for tid, (cb, a) in list(_timers.items()):
+            _timers.pop(tid, None); cb(*a)
+
+    def test_first_change_dispatches_immediately(self):
+        """A fresh device has no previous dispatch, so nothing to wait for."""
+        self.assertIsNone(self.dev._last_dispatch_ms)
+        self.dev._switch.external_write("/SwitchableOutput/cool/Dimming", 22.0)
+        self.fire()
+        self.assertEqual(len(self.mgr.dispatched), 1)
+
+    def test_burst_coalesces_to_one_dispatch(self):
+        sw = self.dev._switch
+        for c in (20.0, 21.0, 22.0):
+            sw.external_write("/SwitchableOutput/cool/Dimming", c)
+        self.fire()
+        self.assertEqual(len(self.mgr.dispatched), 1)
+        self.assertEqual(self.mgr.dispatched[0][1], {"cool_sp": 72})
+
+    def test_second_flush_within_window_is_deferred(self):
+        sw = self.dev._switch
+        sw.external_write("/SwitchableOutput/cool/Dimming", 20.0)
+        self.fire()                       # first dispatch goes out
+        self.assertEqual(len(self.mgr.dispatched), 1)
+        # a further drag step immediately after must not dispatch again;
+        # it reschedules instead of hitting the radio
+        sw.external_write("/SwitchableOutput/cool/Dimming", 21.0)
+        self.fire()
+        self.assertEqual(len(self.mgr.dispatched), 1)
+        self.assertTrue(self.dev._pending or self.dev._pending_timer is not None)
+
+    def test_deferred_dispatch_carries_latest_value(self):
+        sw = self.dev._switch
+        sw.external_write("/SwitchableOutput/cool/Dimming", 20.0)
+        self.fire()
+        for c in (21.0, 22.0, 23.0):      # continued drag while rate-limited
+            sw.external_write("/SwitchableOutput/cool/Dimming", c)
+            self.fire()
+        # pretend the rate-limit window elapsed, then flush
+        self.dev._last_dispatch_ms -= driver.MIN_DISPATCH_INTERVAL_MS + 1.0
+        self.fire()
+        self.assertEqual(len(self.mgr.dispatched), 2)
+        self.assertEqual(self.mgr.dispatched[-1][1], {"cool_sp": 73})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1028,6 +1028,10 @@ async def run_device_monitor(
                         change_queue, pending)
                     unreported += consumed
                     if merged:
+                        # Logged so wire traffic is verifiable: several
+                        # queued batches collapse into one Change here.
+                        logger.info("[%s] Applying change (%d queued): %r",
+                                    address, consumed, merged)
                         await s.change(zone, **merged)
                         await asyncio.sleep(CHANGE_SETTLE_DELAY)
 
