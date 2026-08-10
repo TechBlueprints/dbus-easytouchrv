@@ -1,0 +1,11 @@
+#!/bin/sh
+echo "*** starting dbus-easytouchrv ***"
+exec 2>&1
+. /etc/profile.d/profile.sh
+
+# Brief delay on restart to allow D-Bus name release from previous instance
+sleep 3
+
+echo "Starting EasyTouch RV thermostat manager..."
+cd /data/apps/dbus-easytouchrv
+exec softlimit -d 150000000 -s 2000000 -a 150000000 python3 -u dbus-easytouchrv.py
