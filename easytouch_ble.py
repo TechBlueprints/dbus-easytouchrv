@@ -206,23 +206,32 @@ _SPEED_LABELS = {
 def fan_options(fa_entry: int) -> list[tuple[str, int]]:
     """Build (label, fan-value) choices for one mode's FA capability entry.
 
-    Returns an empty list when the fan is fixed-speed (no user control).
-    Full auto (0x80) is preferred when the unit allows it; otherwise
-    range-auto (0x40, encoded with a speed) provides the "Auto" choice --
-    GE units commonly advertise only 0x40, so offering nothing there would
-    leave the user with no automatic fan option at all.
+    Three families exist, and a unit may allow several:
+      0x80          full auto -- the unit picks the speed
+      0x40 | speed  cycled    -- runs at that speed, on and off with the
+                                compressor ("Cycled and auto fan selections
+                                turn on and off with the compressor or heat
+                                pump" -- EasyTouch manual)
+      speed         manual    -- runs continuously at that speed
+
+    Cycled entries are offered for *every* speed.  Units that advertise no
+    full auto (common on GE) would otherwise get a single "Auto" that
+    silently means cycled-at-lowest-speed -- the reduced airflow that ices
+    an evaporator coil.  Returns an empty list for a fixed-speed fan.
     """
     if fa_entry & FA_FIXED_SPEED:
         return []
-    options: list[tuple[str, int]] = []
-    if fa_entry & FA_ALLOW_FULL_AUTO:
-        options.append(("Auto", FAN_FULL_AUTO))
-    elif fa_entry & FA_ALLOW_RANGE_AUTO:
-        options.append(("Auto", FAN_RANGE_AUTO | 1))
     max_speed = fa_entry & FAN_SPEED_MASK
     labels = _SPEED_LABELS.get(max_speed) or [
         "Speed %d" % i for i in range(1, max_speed + 1)
     ]
+
+    options: list[tuple[str, int]] = []
+    if fa_entry & FA_ALLOW_FULL_AUTO:
+        options.append(("Auto", FAN_FULL_AUTO))
+    if fa_entry & FA_ALLOW_RANGE_AUTO:
+        for speed, label in enumerate(labels, start=1):
+            options.append(("Auto %s" % label, FAN_RANGE_AUTO | speed))
     for speed, label in enumerate(labels, start=1):
         options.append((label, speed))
     if fa_entry & FA_ALLOW_OFF:
@@ -235,14 +244,16 @@ def fan_option_index(options: list[tuple[str, int]], value: int) -> int | None:
 
     Range-auto values collapse onto their manual speed.
     """
+    # Exact match first, so cycled-at-speed lands on its own entry.
+    for i, (_label, v) in enumerate(options):
+        if v == value:
+            return i
+    # Otherwise fall back to the same family at any speed.
     if value & FAN_FULL_AUTO:
         for i, (_label, v) in enumerate(options):
             if v & FAN_FULL_AUTO:
                 return i
-        return None
-    if value & FAN_RANGE_AUTO:
-        # Range-auto reported by the unit: prefer an "Auto" entry when the
-        # dropdown has one, else fall through to its manual speed.
+    elif value & FAN_RANGE_AUTO:
         for i, (_label, v) in enumerate(options):
             if v & FAN_RANGE_AUTO:
                 return i

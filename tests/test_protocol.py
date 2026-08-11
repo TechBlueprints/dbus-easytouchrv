@@ -37,8 +37,21 @@ class FanTests(unittest.TestCase):
     def test_full_options(self):
         # full auto + range auto + off allowed, 3 speeds
         opts = et.fan_options(0x80 | 0x40 | 0x20 | 3)
-        self.assertEqual(opts, [("Auto", 0x80), ("Low", 1), ("Medium", 2),
-                                ("High", 3), ("Off", 0)])
+        self.assertEqual(opts, [
+            ("Auto", 0x80),
+            ("Auto Low", 0x41), ("Auto Medium", 0x42), ("Auto High", 0x43),
+            ("Low", 1), ("Medium", 2), ("High", 3),
+            ("Off", 0)])
+
+    def test_cycled_auto_offered_per_speed(self):
+        """GE units advertise range-auto but no full auto: every cycled
+        speed must be selectable, or "Auto" silently means cycled-at-low."""
+        opts = et.fan_options(66)          # real FA[2] from a GE 347 unit
+        self.assertEqual(opts, [("Auto Low", 0x41), ("Auto High", 0x42),
+                                ("Low", 1), ("High", 2)])
+        for raw, expect in ((0x41, "Auto Low"), (0x42, "Auto High"),
+                            (1, "Low"), (2, "High")):
+            self.assertEqual(opts[et.fan_option_index(opts, raw)][0], expect)
 
     def test_no_off(self):
         opts = et.fan_options(0x80 | 2)
@@ -51,9 +64,10 @@ class FanTests(unittest.TestCase):
     def test_option_index(self):
         opts = et.fan_options(0x80 | 0x20 | 3)  # Auto, Low, Med, High, Off
         self.assertEqual(et.fan_option_index(opts, 0x80), 0)   # full auto
-        self.assertEqual(et.fan_option_index(opts, 0x41), 1)   # range auto speed 1
-        self.assertEqual(et.fan_option_index(opts, 2), 2)
-        self.assertEqual(et.fan_option_index(opts, 0), 4)      # off
+        # no cycled entries here (0x40 not allowed): falls back to the speed
+        self.assertEqual(opts[et.fan_option_index(opts, 0x41)][0], "Low")
+        self.assertEqual(opts[et.fan_option_index(opts, 2)][0], "Medium")
+        self.assertEqual(opts[et.fan_option_index(opts, 0)][0], "Off")
 
     def test_change_keys(self):
         self.assertEqual(et.fan_change_key(et.MODE_FAN_ONLY), "fanOnly")
