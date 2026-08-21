@@ -32,9 +32,12 @@ import re
 import sys
 
 # Make the bundled BLE stack importable when run from the repo.
+# bleak-connection-manager/ext carries dbus-fast 5.x, shadowing Venus OS's
+# older site-packages copy (current bleak requires dbus-fast>=4).
 _ext = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
 for _sub in [
     os.path.join(_ext, "bleak-connection-manager", "src"),
+    os.path.join(_ext, "bleak-connection-manager", "ext"),
     os.path.join(_ext, "bleak-retry-connector", "src"),
     os.path.join(_ext, "bluetooth-adapters", "src"),
     os.path.join(_ext, "aiooui", "src"),

@@ -72,9 +72,13 @@ logging.basicConfig(
 _ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
 sys.path.insert(1, os.path.join(_ext_dir, "velib_python"))
 
-# All BLE dependencies from local ext/ submodules (upstream repos)
+# All BLE dependencies from local ext/ submodules (upstream repos).
+# bleak-connection-manager/ext carries dbus-fast 5.x (pure Python), which
+# must shadow Venus OS's site-packages dbus-fast 2.21.1: current bleak
+# requires dbus-fast>=4 (dbus_fast.annotations).
 for _sub in [
     os.path.join(_ext_dir, "bleak-connection-manager", "src"),
+    os.path.join(_ext_dir, "bleak-connection-manager", "ext"),
     os.path.join(_ext_dir, "bleak-retry-connector", "src"),
     os.path.join(_ext_dir, "bluetooth-adapters", "src"),
     os.path.join(_ext_dir, "aiooui", "src"),
