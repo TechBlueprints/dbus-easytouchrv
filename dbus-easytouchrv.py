@@ -86,45 +86,10 @@ for _sub in [
 from vedbus import VeDbusService  # noqa: E402
 from settingsdevice import SettingsDevice  # noqa: E402
 
-from bleak_connection_manager import install_bleak_catcher  # noqa: E402
+# Installed before easytouch_ble captures bleak's classes at import time.
+from catcher_setup import install_catcher_from_config  # noqa: E402
 
-
-def _catcher_options() -> tuple[list[str], dict[str, int]]:
-    """Adapter entries and link caps for the bleak catcher, from config.ini.
-
-    Read here, ahead of the manager's full config load, because the catcher
-    must be installed before easytouch_ble is imported (that module captures
-    bleak.BleakClient / bleak.BleakScanner at import time).
-    """
-    cfg = configparser.ConfigParser()
-    config_dir = os.path.dirname(os.path.abspath(__file__))
-    for name in ("config.ini", "config.default.ini"):
-        path = os.path.join(config_dir, name)
-        if os.path.exists(path):
-            cfg.read(path)
-            break
-    defaults = cfg["DEFAULT"] if "DEFAULT" in cfg else {}
-    # Raw entries, passed to the catcher verbatim: "MAC@hciX" pins a device
-    # to an adapter, plain "hciX" entries form the shared pool.  Empty means
-    # every adapter the kernel exposes is a candidate.
-    adapters = defaults.get("adapters", "").replace(",", " ").split()
-    # "hciX:N" caps established links on that adapter (deployment config
-    # for dongles with undocumented limits, e.g. CSR ~5).
-    link_caps: dict[str, int] = {}
-    for entry in defaults.get("link_caps", "").replace(",", " ").split():
-        adapter, _, cap = entry.partition(":")
-        if adapter and cap.isdigit():
-            link_caps[adapter] = int(cap)
-    return adapters, link_caps
-
-
-_adapters, _link_caps = _catcher_options()
-install_bleak_catcher(
-    "dbus-easytouchrv",
-    adapters=_adapters,
-    link_caps=_link_caps,
-    wrap_scanner=True,
-)
+install_catcher_from_config("dbus-easytouchrv")
 
 from easytouch_ble import (  # noqa: E402
     run_device_monitor,

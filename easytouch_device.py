@@ -57,9 +57,9 @@ for _sub in [
 
 # Installed before easytouch_ble captures bleak's classes at import time.
 # On non-Linux hosts the catcher's claims/mgmt layers degrade to no-ops.
-from bleak_connection_manager import install_bleak_catcher  # noqa: E402
+from catcher_setup import install_catcher_from_config  # noqa: E402
 
-install_bleak_catcher("easytouch-probe", wrap_scanner=True)
+install_catcher_from_config("easytouch-probe")
 
 from easytouch_ble import (  # noqa: E402
     EasyTouchSession,
