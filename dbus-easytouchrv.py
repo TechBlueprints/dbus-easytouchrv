@@ -60,6 +60,14 @@ import dbus
 from gi.repository import GLib
 from dbus.mainloop.glib import DBusGMainLoop
 
+# Configured before the bleak catcher installs below, so its install-time
+# log line (and anything else emitted during imports) is not dropped.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
 # Add ext folders to sys.path
 _ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
 sys.path.insert(1, os.path.join(_ext_dir, "velib_python"))
@@ -142,11 +150,6 @@ from easytouch_ble import (  # noqa: E402
 
 VERSION = "0.2.0"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 logger = logging.getLogger("dbus-easytouchrv")
 
 # Defaults
