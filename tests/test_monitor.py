@@ -11,15 +11,12 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for name in ("bleak",):
     mod = types.ModuleType(name)
     mod.BleakClient = object
+    mod.BleakScanner = object
     sys.modules.setdefault(name, mod)
 
-bcm = types.ModuleType("bleak_connection_manager")
-for sym in ("EscalationConfig", "EscalationPolicy", "LockConfig", "ScanLockConfig"):
-    setattr(bcm, sym, type(sym, (), {"__init__": lambda self, *a, **k: None}))
-for fn in ("establish_connection", "discover_adapters", "managed_discover",
-           "managed_find_device", "validate_char_exists"):
-    setattr(bcm, fn, lambda *a, **k: None)
-sys.modules.setdefault("bleak_connection_manager", bcm)
+brc = types.ModuleType("bleak_retry_connector")
+brc.establish_connection = lambda *a, **k: None
+sys.modules.setdefault("bleak_retry_connector", brc)
 
 sys.path.insert(0, _REPO_ROOT)
 
@@ -42,8 +39,7 @@ class FakeSession:
     fail_connects = 0          # raise on __aenter__ this many times
     status_replies = None      # optional list; None entry = no reply
 
-    def __init__(self, address, passcode="", lock_config=None,
-                 scan_lock_config=None):
+    def __init__(self, address, passcode=""):
         self.address = address
         self.ble_name = "EasyTouch 347000123"
         self.commands = []

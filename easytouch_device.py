@@ -55,6 +55,12 @@ for _sub in [
     if os.path.isdir(_sub) and _sub not in sys.path:
         sys.path.insert(0, _sub)
 
+# Installed before easytouch_ble captures bleak's classes at import time.
+# On non-Linux hosts the catcher's claims/mgmt layers degrade to no-ops.
+from bleak_connection_manager import install_bleak_catcher  # noqa: E402
+
+install_bleak_catcher("easytouch-probe", wrap_scanner=True)
+
 from easytouch_ble import (  # noqa: E402
     EasyTouchSession,
     scan_for_thermostats,

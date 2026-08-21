@@ -221,7 +221,8 @@ dbus-easytouchrv.py         Single-process service
   +-- easytouch_ble.py       BLE protocol module
   |     JSON-over-GATT command/response, passcode handshake
   |     run_device_monitor supervisor (persistent or transient sessions)
-  |     Cross-process locking & adapter rotation via bleak-connection-manager
+  |     Claim-aware adapter routing via bleak-connection-manager v2's
+  |     process-wide bleak catcher; retries via bleak-retry-connector
   |     get_status / get_config / change / ExtraData; capability decoding
   |
   +-- easytouch_device.py    Standalone CLI probe tool

@@ -30,9 +30,13 @@ Messages are plain UTF-8 JSON objects with a top-level ``Type`` field.  There
 is no binary framing, checksum, or manual chunking; the ATT layer performs
 long reads/writes for payloads larger than the negotiated MTU.
 
-Connection model: transient sessions (connect, exchange, disconnect).  Uses
-bleak-connection-manager for adapter rotation, scan locking, and cross-process
-coordination.
+Connection model: transient sessions (connect, exchange, disconnect).
+Adapter selection, cross-process claims coordination, and connection-parameter
+tuning come from bleak-connection-manager v2's process-wide bleak catcher:
+the entry point must call ``install_bleak_catcher(...)`` BEFORE importing
+this module, because the ``BleakClient`` / ``BleakScanner`` bindings below
+are captured at import time.  Retry semantics come from
+bleak-retry-connector's ``establish_connection``.
 """
 
 from __future__ import annotations
@@ -43,19 +47,8 @@ import logging
 import time
 from dataclasses import dataclass, field
 
-from bleak import BleakClient
-
-from bleak_connection_manager import (
-    EscalationConfig,
-    EscalationPolicy,
-    LockConfig,
-    ScanLockConfig,
-    establish_connection,
-    discover_adapters,
-    managed_discover,
-    managed_find_device,
-    validate_char_exists,
-)
+from bleak import BleakClient, BleakScanner
+from bleak_retry_connector import establish_connection
 
 logger = logging.getLogger(__name__)
 
@@ -586,34 +579,24 @@ class DiscoveredThermostat:
 
 async def scan_for_thermostats(
     timeout: float = 12.0,
-    scan_lock_config: ScanLockConfig | None = None,
 ) -> list[DiscoveredThermostat]:
     """Scan BLE for EasyTouch RV controllers.
 
-    Uses bleak-connection-manager's managed_discover for automatic adapter
-    rotation, scan locking, and InProgress retry.
+    With the bleak catcher installed (wrap_scanner=True), the scan runs on a
+    claim-coordinated adapter chosen by live occupancy.
     """
-    if scan_lock_config is None:
-        scan_lock_config = ScanLockConfig(enabled=True)
-
-    devices = await managed_discover(
-        timeout=timeout,
-        scan_lock_config=scan_lock_config,
-    )
+    discovered = await BleakScanner.discover(timeout=timeout, return_adv=True)
 
     found: dict[str, DiscoveredThermostat] = {}
-    for device in devices:
-        name = device.name or ""
+    for device, adv in discovered.values():
+        name = device.name or adv.local_name or ""
         if NAME_SUBSTRING not in name:
             continue
 
         mac = device.address.upper()
         if mac not in found:
-            found[mac] = DiscoveredThermostat(
-                mac=mac,
-                name=name,
-                rssi=getattr(device, "rssi", -100),
-            )
+            rssi = adv.rssi if adv.rssi is not None else -100
+            found[mac] = DiscoveredThermostat(mac=mac, name=name, rssi=rssi)
             logger.info("Discovered %s (%s) on scan", name, mac)
 
     return list(found.values())
@@ -634,53 +617,56 @@ class EasyTouchSession:
             await s.change(zone=0, mode=MODE_COOL, cool_sp=74)
     """
 
+    # Scan attempts made to resolve the device before giving up; each
+    # attempt is one BleakScanner discovery window.
+    FIND_ATTEMPTS = 3
+    FIND_TIMEOUT = 15.0
+
     def __init__(
         self,
         address: str,
         passcode: str = "",
-        lock_config: LockConfig | None = None,
-        scan_lock_config: ScanLockConfig | None = None,
     ):
         self._address = address
         self._passcode = passcode or ""
-        self._lock_config = lock_config or LockConfig(enabled=True)
-        self._scan_lock_config = scan_lock_config or ScanLockConfig(enabled=True)
         self._client: BleakClient | None = None
         self._time_syncs_left = 3
         self.ble_name: str = ""    # advertised name captured during scanning
 
     async def __aenter__(self) -> "EasyTouchSession":
-        adapters = discover_adapters()
-        escalation = EscalationPolicy(adapters, config=EscalationConfig(reset_adapter=False))
-
         logger.info("[%s] Scanning...", self._address)
-        device = await managed_find_device(
-            self._address,
-            timeout=15.0,
-            max_attempts=3,
-            scan_lock_config=self._scan_lock_config,
-        )
+        device = None
+        for attempt in range(self.FIND_ATTEMPTS):
+            device = await BleakScanner.find_device_by_address(
+                self._address, timeout=self.FIND_TIMEOUT)
+            if device is not None:
+                break
+            logger.debug("[%s] Not seen in scan attempt %d/%d",
+                         self._address, attempt + 1, self.FIND_ATTEMPTS)
         if device is None:
             raise ConnectionError(f"[{self._address}] Device not found after scanning")
         self.ble_name = device.name or ""
 
         logger.info("[%s] Connecting...", self._address)
+        # The catcher routes each attempt to a claim-aware adapter;
+        # establish_connection supplies the retry/backoff semantics.
         self._client = await establish_connection(
             BleakClient,
             device,
             "EasyTouch %s" % self._address,
             max_attempts=4,
-            close_inactive_connections=True,
-            try_direct_first=True,
-            validate_connection=validate_char_exists(RETURN_UUID),
-            lock_config=self._lock_config,
-            escalation_policy=escalation,
-            overall_timeout=300.0,
         )
         # From here on the connection is live: any failure must disconnect
         # before propagating, because __aexit__ is not called when
         # __aenter__ raises.
         try:
+            # The wrong device (or a half-resolved service table) lacks the
+            # vendor return characteristic; fail fast so the retry loop in
+            # the monitor reconnects instead of timing out per exchange.
+            if self._client.services.get_characteristic(RETURN_UUID) is None:
+                raise ConnectionError(
+                    "[%s] Vendor characteristic %s missing after connect"
+                    % (self._address, RETURN_UUID))
             logger.info("[%s] Connected (MTU: %d)", self._address, self._client.mtu_size)
             if self._passcode:
                 await self._authenticate()
@@ -743,10 +729,11 @@ class EasyTouchSession:
         When ``expect_rt`` is given, keep polling until a response with that
         ``RT`` arrives, so replies are correlated with their request.
         """
-        # Deliberately not gated on client.is_connected: after a
-        # bleak-connection-manager watchdog cleanup, BlueZ's device object is
-        # removed and no property signal follows, so the client's cached
-        # is_connected is stranded and no longer reflects reality.  Attempt
+        # Deliberately not gated on client.is_connected: after an adapter
+        # recovery/reset (e.g. the catcher's scanner watchdog), BlueZ's
+        # device object is removed and no property signal follows, so the
+        # client's cached is_connected is stranded and no longer reflects
+        # reality.  Attempt
         # the operation and let a real failure surface instead -- an
         # unanswered exchange trips the monitor's missed-status counter,
         # which tears the session down and reconnects.
@@ -903,8 +890,6 @@ async def poll_device(
     need_config: bool = False,
     model_prefix: str = "",
     want_extra: bool = True,
-    lock_config: LockConfig | None = None,
-    scan_lock_config: ScanLockConfig | None = None,
 ) -> DeviceSnapshot:
     """Connect and read status (plus config/diagnostics) in one session.
 
@@ -913,7 +898,7 @@ async def poll_device(
     run_coroutine_threadsafe; returns an empty snapshot on failure.
     """
     try:
-        async with EasyTouchSession(address, passcode, lock_config, scan_lock_config) as s:
+        async with EasyTouchSession(address, passcode) as s:
             snap = DeviceSnapshot(ble_name=s.ble_name)
             prefix = model_prefix or model_prefix_from_name(s.ble_name)
             if need_config:
@@ -1005,8 +990,6 @@ async def run_device_monitor(
     on_snapshot,
     settings: MonitorSettings | None = None,
     session_factory=EasyTouchSession,
-    lock_config: LockConfig | None = None,
-    scan_lock_config: ScanLockConfig | None = None,
 ) -> None:
     """Supervise one thermostat until cancelled.
 
@@ -1025,8 +1008,7 @@ async def run_device_monitor(
 
     while True:
         try:
-            async with session_factory(address, passcode,
-                                       lock_config, scan_lock_config) as s:
+            async with session_factory(address, passcode) as s:
                 backoff_attempt = 0
                 prefix = model_prefix or model_prefix_from_name(s.ble_name)
                 cfg = await s.get_config(zone)

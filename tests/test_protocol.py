@@ -1,6 +1,6 @@
 """Offline logic tests for dbus-easytouchrv (no BLE, no D-Bus).
 
-Stubs bleak/bleak_connection_manager so easytouch_ble imports cleanly on
+Stubs bleak/bleak_retry_connector so easytouch_ble imports cleanly on
 the dev machine, then exercises the pure protocol/UI-mapping helpers.
 """
 import os
@@ -15,15 +15,12 @@ import unittest
 for name in ("bleak",):
     mod = types.ModuleType(name)
     mod.BleakClient = object
+    mod.BleakScanner = object
     sys.modules.setdefault(name, mod)
 
-bcm = types.ModuleType("bleak_connection_manager")
-for sym in ("EscalationConfig", "EscalationPolicy", "LockConfig", "ScanLockConfig"):
-    setattr(bcm, sym, type(sym, (), {"__init__": lambda self, *a, **k: None}))
-for fn in ("establish_connection", "discover_adapters", "managed_discover",
-           "managed_find_device", "validate_char_exists"):
-    setattr(bcm, fn, lambda *a, **k: None)
-sys.modules.setdefault("bleak_connection_manager", bcm)
+brc = types.ModuleType("bleak_retry_connector")
+brc.establish_connection = lambda *a, **k: None
+sys.modules.setdefault("bleak_retry_connector", brc)
 
 sys.path.insert(0, _REPO_ROOT)
 

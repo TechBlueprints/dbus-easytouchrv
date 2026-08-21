@@ -16,14 +16,17 @@ import unittest
 for name in ("bleak",):
     mod = types.ModuleType(name)
     mod.BleakClient = object
+    mod.BleakScanner = object
     sys.modules.setdefault(name, mod)
 
+brc = types.ModuleType("bleak_retry_connector")
+brc.establish_connection = lambda *a, **k: None
+sys.modules.setdefault("bleak_retry_connector", brc)
+
+# The driver installs the bleak catcher at import; a no-op stub keeps the
+# smoke test radio-free.
 bcm = types.ModuleType("bleak_connection_manager")
-for sym in ("EscalationConfig", "EscalationPolicy", "LockConfig", "ScanLockConfig"):
-    setattr(bcm, sym, type(sym, (), {"__init__": lambda self, *a, **k: None}))
-for fn in ("establish_connection", "discover_adapters", "managed_discover",
-           "managed_find_device", "validate_char_exists"):
-    setattr(bcm, fn, lambda *a, **k: None)
+bcm.install_bleak_catcher = lambda *a, **k: None
 sys.modules.setdefault("bleak_connection_manager", bcm)
 
 # ── Stub dbus / gi / vedbus ─────────────────────────────────────────────────
