@@ -18,6 +18,15 @@ brc = types.ModuleType("bleak_retry_connector")
 brc.establish_connection = lambda *a, **k: None
 sys.modules.setdefault("bleak_retry_connector", brc)
 
+bcm = types.ModuleType("bleak_connection_manager")
+bcm.install_bleak_catcher = lambda *a, **k: None
+vmod = types.ModuleType("bleak_connection_manager.validators")
+vmod.validate_char_exists = lambda uuid: (lambda client: True)
+vmod.tolerate_late_gatt = lambda validator: validator
+bcm.validators = vmod
+sys.modules.setdefault("bleak_connection_manager", bcm)
+sys.modules.setdefault("bleak_connection_manager.validators", vmod)
+
 sys.path.insert(0, _REPO_ROOT)
 
 import easytouch_ble as et  # noqa: E402

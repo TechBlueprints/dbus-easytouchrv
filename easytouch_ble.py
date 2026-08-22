@@ -49,6 +49,10 @@ from dataclasses import dataclass, field
 
 from bleak import BleakClient, BleakScanner
 from bleak_retry_connector import establish_connection
+from bleak_connection_manager.validators import (
+    tolerate_late_gatt,
+    validate_char_exists,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -648,25 +652,25 @@ class EasyTouchSession:
         self.ble_name = device.name or ""
 
         logger.info("[%s] Connecting...", self._address)
-        # The catcher routes each attempt to a claim-aware adapter;
-        # establish_connection supplies the retry/backoff semantics.
+        # The catcher routes each attempt to a claim-aware adapter and runs
+        # the validator once the link is up: a link without the vendor
+        # return characteristic is torn down, scored against that adapter,
+        # and retried on the next radio inside establish_connection —
+        # v1's validate_connection semantics.  tolerate_late_gatt keeps
+        # v1's escalating waits for chips that register vendor services
+        # after ServicesResolved.
         self._client = await establish_connection(
             BleakClient,
             device,
             "EasyTouch %s" % self._address,
             max_attempts=4,
+            validate_connection=tolerate_late_gatt(
+                validate_char_exists(RETURN_UUID)),
         )
         # From here on the connection is live: any failure must disconnect
         # before propagating, because __aexit__ is not called when
         # __aenter__ raises.
         try:
-            # The wrong device (or a half-resolved service table) lacks the
-            # vendor return characteristic; fail fast so the retry loop in
-            # the monitor reconnects instead of timing out per exchange.
-            if self._client.services.get_characteristic(RETURN_UUID) is None:
-                raise ConnectionError(
-                    "[%s] Vendor characteristic %s missing after connect"
-                    % (self._address, RETURN_UUID))
             logger.info("[%s] Connected (MTU: %d)", self._address, self._client.mtu_size)
             if self._passcode:
                 await self._authenticate()

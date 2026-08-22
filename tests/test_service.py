@@ -27,7 +27,12 @@ sys.modules.setdefault("bleak_retry_connector", brc)
 # smoke test radio-free.
 bcm = types.ModuleType("bleak_connection_manager")
 bcm.install_bleak_catcher = lambda *a, **k: None
+vmod = types.ModuleType("bleak_connection_manager.validators")
+vmod.validate_char_exists = lambda uuid: (lambda client: True)
+vmod.tolerate_late_gatt = lambda validator: validator
+bcm.validators = vmod
 sys.modules.setdefault("bleak_connection_manager", bcm)
+sys.modules.setdefault("bleak_connection_manager.validators", vmod)
 
 # ── Stub dbus / gi / vedbus ─────────────────────────────────────────────────
 dbus_mod = types.ModuleType("dbus")
