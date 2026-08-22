@@ -117,7 +117,7 @@ async def run_monitor_cycles(snapshots, n_cycles, **kw):
         "AA:BB:CC:DD:EE:FF", 0, "", "",
         change_queue=kw.pop("change_queue", queue),
         on_snapshot=on_snapshot,
-        session_factory=FakeSession,
+        session_factory=kw.pop("session_factory", FakeSession),
         settings=settings,
         **kw,
     ))
@@ -271,6 +271,180 @@ class MonitorTests(unittest.TestCase):
         # The persistent session was closed and new sessions opened.
         self.assertGreaterEqual(len(FakeSession.instances), 2)
         self.assertTrue(FakeSession.instances[0].exited)
+
+
+class SlowExitSession(FakeSession):
+    """FakeSession whose __aexit__ needs the loop to keep running: the
+    disconnect only completes if cancellation semantics let cleanup await."""
+
+    async def __aexit__(self, *exc):
+        await asyncio.sleep(0.02)
+        self.exited = True
+
+
+class ShutdownDisconnectTests(unittest.TestCase):
+    """The disconnect must complete even when the owning task is cancelled
+    (the stale-BlueZ-link restart quirk: a lost disconnect leaves the LE
+    link up and the thermostat never advertises again)."""
+
+    def setUp(self):
+        reset_fake()
+
+    def run_async(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_monitor_cancel_completes_session_exit(self):
+        """Cancelling the monitor mid-session still runs __aexit__ fully."""
+        snapshots = []
+
+        async def go():
+            await run_monitor_cycles(snapshots, 1,
+                                     session_factory=SlowExitSession)
+        self.run_async(go())
+        self.assertEqual(len(FakeSession.instances), 1)
+        self.assertTrue(FakeSession.instances[0].exited)
+
+    def test_aexit_disconnect_survives_cancellation(self):
+        """A cancellation landing DURING the disconnect wait does not kill
+        the in-flight disconnect (asyncio.shield in __aexit__), and the
+        cancellation is still honored afterwards."""
+        started = asyncio.Event()
+        finished = asyncio.Event()
+
+        class FakeClient:
+            async def disconnect(self):
+                started.set()
+                await asyncio.sleep(0.05)
+                finished.set()
+
+        async def go():
+            s = et.EasyTouchSession("AA:BB:CC:DD:EE:FF")
+            s._client = FakeClient()
+            task = asyncio.ensure_future(s.__aexit__(None, None, None))
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertTrue(finished.is_set())
+            self.assertIsNone(s._client)
+        self.run_async(go())
+
+    def test_aexit_disconnect_timeout_gives_up(self):
+        """A hung disconnect is abandoned after the session's timeout."""
+        cancelled = asyncio.Event()
+
+        class HungClient:
+            async def disconnect(self):
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+
+        async def go():
+            s = et.EasyTouchSession("AA:BB:CC:DD:EE:FF")
+            s.DISCONNECT_TIMEOUT = 0.05
+            s._client = HungClient()
+            await s.__aexit__(None, None, None)   # returns, no hang
+            await asyncio.sleep(0)                # let the cancel land
+            self.assertTrue(cancelled.is_set())
+        self.run_async(go())
+
+
+class StaleLinkSweepTests(unittest.TestCase):
+    """The startup self-remediation: after N failed find attempts the
+    session sweeps BlueZ for a stale LE link before scanning again."""
+
+    def setUp(self):
+        reset_fake()
+        self._orig_scanner = et.BleakScanner
+        self._orig_establish = et.establish_connection
+        self._orig_sweep = et.disconnect_stale_link
+
+    def tearDown(self):
+        et.BleakScanner = self._orig_scanner
+        et.establish_connection = self._orig_establish
+        et.disconnect_stale_link = self._orig_sweep
+
+    def run_async(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def _install(self, find_results, sweep_log):
+        """Stub the scanner (scripted find results), the connector and the
+        sweep hook.  sweep_log records how many finds had run at sweep time."""
+        finds = []
+
+        class StubScanner:
+            @staticmethod
+            async def find_device_by_address(address, timeout=0):
+                result = find_results[len(finds)]
+                finds.append(address)
+                if result:
+                    return types.SimpleNamespace(
+                        name="EasyTouch 347000123", address=address)
+                return None
+
+        class StubClient:
+            mtu_size = 23
+
+            async def disconnect(self):
+                pass
+
+        async def fake_establish(*a, **k):
+            return StubClient()
+
+        async def fake_sweep(address):
+            sweep_log.append(len(finds))
+            return True
+
+        et.BleakScanner = StubScanner
+        et.establish_connection = fake_establish
+        et.disconnect_stale_link = fake_sweep
+        return finds
+
+    def test_sweep_after_n_failed_finds_then_device_appears(self):
+        sweeps = []
+        finds = self._install([False, False, True], sweeps)
+
+        async def go():
+            s = et.EasyTouchSession("AA:BB:CC:DD:EE:FF")
+            await s.__aenter__()
+            await s.__aexit__(None, None, None)
+        self.run_async(go())
+        # Sweep ran exactly once, after exactly STALE_SWEEP_AFTER (=2)
+        # failed find attempts, and the third attempt then succeeded.
+        self.assertEqual(sweeps, [et.EasyTouchSession.STALE_SWEEP_AFTER])
+        self.assertEqual(len(finds), 3)
+
+    def test_no_sweep_when_found_immediately(self):
+        sweeps = []
+        finds = self._install([True], sweeps)
+
+        async def go():
+            s = et.EasyTouchSession("AA:BB:CC:DD:EE:FF")
+            await s.__aenter__()
+            await s.__aexit__(None, None, None)
+        self.run_async(go())
+        self.assertEqual(sweeps, [])
+        self.assertEqual(len(finds), 1)
+
+    def test_sweep_once_even_when_never_found(self):
+        sweeps = []
+        self._install([False, False, False], sweeps)
+
+        async def go():
+            s = et.EasyTouchSession("AA:BB:CC:DD:EE:FF")
+            with self.assertRaises(ConnectionError):
+                await s.__aenter__()
+        self.run_async(go())
+        self.assertEqual(sweeps, [et.EasyTouchSession.STALE_SWEEP_AFTER])
+
+    def test_disconnect_stale_link_degrades_without_bluez(self):
+        """On non-Linux / stubbed stacks the sweep is a silent no-op: the
+        bleak stub has no bluezdbus backend, so the helper returns False."""
+        result = self.run_async(
+            et.disconnect_stale_link("AA:BB:CC:DD:EE:FF"))
+        self.assertIs(result, False)
 
 
 if __name__ == "__main__":

@@ -151,6 +151,12 @@ TEMP_TYPE_OUTDOOR = 4
 RECONNECT_BASE_DELAY = 30      # seconds
 RECONNECT_MAX_DELAY = 900      # 15 minutes
 
+# Budget for the monitor tasks to complete their BLE disconnects on
+# shutdown.  Both live thermostats disconnect concurrently, each bounded
+# by the session's own 5s disconnect timeout; daemontools has no kill
+# timer, so a few seconds here costs nothing and saves the stale links.
+SHUTDOWN_TIMEOUT = 8.0
+
 # Control writes are coalesced for this long before one BLE session
 # applies them all (mirrors the vendor app's behaviour).  The timer
 # restarts on each write, so a burst collapses into one message.
@@ -326,9 +332,11 @@ class ThermostatDevice:
         self.dev_id = mac.replace(":", "").lower() + ("_z%d" % zone if zone else "")
         self.monitor_settings = monitor_settings or MonitorSettings()
 
-        # Set by the manager when the monitor task is started.
+        # Set by the manager when the monitor task is started.  The asyncio
+        # Task handle (not run_coroutine_threadsafe's wrapping future) is
+        # what shutdown needs -- see EasyTouchManager.stop().
         self.change_queue = None
-        self.monitor_future = None
+        self.monitor_task = None
 
         self.config: ZoneConfig | None = None
         self.last_status: ZoneStatus | None = None
@@ -1166,19 +1174,47 @@ class EasyTouchManager:
                 logger.error("[%s] Could not create change queue; "
                              "device not monitored", dev.dev_id)
                 continue
-            dev.monitor_future = asyncio.run_coroutine_threadsafe(
+            dev.monitor_task = self._spawn_monitor(
                 run_device_monitor(
                     dev.mac, dev.zone, dev.passcode, dev.model_prefix,
                     change_queue=dev.change_queue,
                     on_snapshot=self._make_snapshot_handler(dev.dev_id),
                     settings=dev.monitor_settings,
                 ),
-                self._async_loop,
             )
+            if dev.monitor_task is None:
+                logger.error("[%s] Could not start monitor task", dev.dev_id)
+                continue
             logger.info("[%s] Monitor started (%s, %.0fs)", dev.dev_id,
                         "persistent" if dev.monitor_settings.persistent
                         else "transient",
                         dev.monitor_settings.poll_seconds)
+
+    def _spawn_monitor(self, coro):
+        """Create a Task for ``coro`` on the monitor loop; returns the Task.
+
+        The real Task handle is kept instead of run_coroutine_threadsafe's
+        wrapping concurrent future because the wrapper is useless for
+        shutdown: cancelling a pending concurrent future marks IT cancelled
+        locally and immediately, so result() raises CancelledError without
+        ever waiting for the task's cleanup to run on the loop.  stop()
+        must cancel the real Task and then genuinely wait for its session
+        __aexit__ (the BLE disconnect) to finish.
+        """
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+
+        def create():
+            try:
+                fut.set_result(self._async_loop.create_task(coro))
+            except BaseException as e:
+                fut.set_exception(e)
+
+        try:
+            self._async_loop.call_soon_threadsafe(create)
+            return fut.result(timeout=5)
+        except Exception:
+            logger.exception("Failed to start monitor task")
+            return None
 
     def _make_queue(self):
         """Create an asyncio.Queue bound to the monitor loop (Py3.8-safe)."""
@@ -1252,19 +1288,46 @@ class EasyTouchManager:
     # ── Shutdown ───────────────────────────────────────────────────────
 
     def stop(self):
-        # Cancel monitor tasks so their sessions disconnect cleanly.
-        futures = [dev.monitor_future for dev in self._devices.values()
-                   if dev.monitor_future is not None]
-        for fut in futures:
-            fut.cancel()
-        for fut in futures:
-            try:
-                fut.result(timeout=6)
-            except (concurrent.futures.CancelledError, asyncio.CancelledError):
-                pass
-            except Exception:
-                pass
+        """Cancel the monitors and wait for their BLE disconnects to land.
+
+        Runs on the GLib thread (signal handler).  The cancellation must be
+        delivered ON the asyncio loop, and the loop must keep running until
+        each monitor's session __aexit__ has pushed its Disconnect through
+        BlueZ: bluetoothd does not tear LE links down when their creator
+        exits, and a still-linked EasyTouch never advertises, so any
+        disconnect lost here is a device the next service instance cannot
+        find (the stale-link restart quirk).
+
+        The previous implementation cancelled the run_coroutine_threadsafe
+        futures and waited on them -- but cancelling a pending concurrent
+        future marks it cancelled locally and immediately, so result()
+        raised CancelledError at once and loop.stop() was scheduled in the
+        same callback batch as the task cancellations.  The loop shut down
+        before the monitor tasks even received their CancelledError; no
+        disconnect was ever sent ("Received signal 15" and "Service
+        stopped" landed 3 ms apart in the production log).
+        """
         loop = self._async_loop
+        tasks = [dev.monitor_task for dev in self._devices.values()
+                 if dev.monitor_task is not None]
+        if loop is not None and loop.is_running() and tasks:
+            async def shutdown():
+                for t in tasks:
+                    t.cancel()
+                _done, pending = await asyncio.wait(
+                    tasks, timeout=SHUTDOWN_TIMEOUT)
+                if pending:
+                    logger.warning(
+                        "%d monitor task(s) did not finish shutdown within "
+                        "%.0fs; their BLE links may be left connected",
+                        len(pending), SHUTDOWN_TIMEOUT)
+
+            try:
+                asyncio.run_coroutine_threadsafe(shutdown(), loop).result(
+                    timeout=SHUTDOWN_TIMEOUT + 2)
+            except Exception:
+                logger.warning("Monitor shutdown did not complete cleanly",
+                               exc_info=True)
         if loop is not None and loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
         logger.info("Service stopped")

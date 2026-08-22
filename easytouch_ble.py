@@ -606,6 +606,76 @@ async def scan_for_thermostats(
     return list(found.values())
 
 
+# ── Stale-link remediation ────────────────────────────────────────────────────
+
+async def disconnect_stale_link(address: str, timeout: float = 10.0) -> bool:
+    """Drop a leftover BlueZ LE link to ``address`` on ANY adapter.
+
+    A previous process that exited without completing its disconnects
+    leaves its LE links alive inside BlueZ -- bluetoothd does not tie a
+    connection's lifetime to the D-Bus client that created it.  An
+    EasyTouch unit accepts exactly one BLE central and stops advertising
+    while linked, so such a stale link makes the device permanently
+    invisible to scans ("Device not found after scanning", forever).
+
+    This asks BlueZ over D-Bus -- through bleak's already-connected BlueZ
+    manager bus -- for every Device1 object carrying our MAC that reports
+    Connected=true.  The object path encodes the adapter
+    (/org/bluez/hciN/dev_...), so links parked on non-default adapters are
+    found too; ``bluetoothctl disconnect`` only talks to the default
+    controller and misses those.  Each stale object gets a
+    Device1.Disconnect() call.
+
+    Returns True when at least one stale link was told to disconnect.
+    Degrades silently to False anywhere the BlueZ D-Bus stack is
+    unavailable (macOS CLI use, tests with stubbed bleak).
+    """
+    try:
+        from bleak.backends.bluezdbus import defs
+        from bleak.backends.bluezdbus.manager import get_global_bluez_manager
+        from dbus_fast import Message, MessageType
+    except Exception:
+        logger.debug("[%s] Stale-link sweep unavailable on this platform",
+                     address)
+        return False
+
+    mac = address.strip().upper()
+    try:
+        manager = await get_global_bluez_manager()
+        stale = [
+            path
+            for path, interfaces in list(manager._properties.items())
+            if (props := interfaces.get(defs.DEVICE_INTERFACE)) is not None
+            and str(props.get("Address", "")).upper() == mac
+            and props.get("Connected")
+        ]
+        dropped = False
+        for path in stale:
+            logger.warning(
+                "[%s] Stale BlueZ link at %s (left by a previous process); "
+                "disconnecting it", address, path)
+            reply = await asyncio.wait_for(
+                manager._bus.call(
+                    Message(
+                        destination=defs.BLUEZ_SERVICE,
+                        path=path,
+                        interface=defs.DEVICE_INTERFACE,
+                        member="Disconnect",
+                    )
+                ),
+                timeout,
+            )
+            if reply is not None and reply.message_type == MessageType.ERROR:
+                logger.warning("[%s] BlueZ refused Disconnect on %s: %s %r",
+                               address, path, reply.error_name, reply.body)
+            else:
+                dropped = True
+        return dropped
+    except Exception:
+        logger.debug("[%s] Stale-link sweep failed", address, exc_info=True)
+        return False
+
+
 # ── Transient BLE session ─────────────────────────────────────────────────────
 
 class EasyTouchSession:
@@ -625,6 +695,13 @@ class EasyTouchSession:
     # attempt is one BleakScanner discovery window.
     FIND_ATTEMPTS = 3
     FIND_TIMEOUT = 15.0
+    # After this many failed find attempts, sweep BlueZ for a stale LE
+    # link to the device (see disconnect_stale_link) before scanning
+    # again: an EasyTouch does not advertise while linked, so a leftover
+    # link from a previous process makes every scan come up empty.
+    STALE_SWEEP_AFTER = 2
+    # Ceiling on a session-exit disconnect before it is abandoned.
+    DISCONNECT_TIMEOUT = 5.0
 
     def __init__(
         self,
@@ -647,6 +724,12 @@ class EasyTouchSession:
                 break
             logger.debug("[%s] Not seen in scan attempt %d/%d",
                          self._address, attempt + 1, self.FIND_ATTEMPTS)
+            if attempt + 1 == self.STALE_SWEEP_AFTER:
+                # Repeatedly invisible: the unit may be held by a stale
+                # BlueZ link (it only accepts one central and goes silent
+                # while linked).  Drop any such link -- on any adapter --
+                # so the next scan window can see it advertise again.
+                await disconnect_stale_link(self._address)
         if device is None:
             raise ConnectionError(f"[{self._address}] Device not found after scanning")
         self.ble_name = device.name or ""
@@ -681,13 +764,44 @@ class EasyTouchSession:
         return self
 
     async def __aexit__(self, *exc: object) -> None:
-        if self._client is not None:
+        if self._client is None:
+            return
+        client, self._client = self._client, None
+        # The disconnect runs as its own task and the wait on it is
+        # shielded: on service shutdown this session's task is CANCELLED,
+        # and if a second cancellation lands while we sit in this await, a
+        # plain ``await client.disconnect()`` would die before the
+        # Disconnect call ever reached BlueZ.  BlueZ keeps LE links alive
+        # when their creator exits without disconnecting, and a linked
+        # EasyTouch stops advertising, so a disconnect lost here leaves the
+        # device unfindable for the next process (the stale-link restart
+        # quirk).
+        disconnect = asyncio.ensure_future(client.disconnect())
+        cancelled = False
+        while True:
             try:
-                await asyncio.wait_for(self._client.disconnect(), timeout=5.0)
+                await asyncio.wait_for(asyncio.shield(disconnect),
+                                       timeout=self.DISCONNECT_TIMEOUT)
                 logger.debug("[%s] Disconnected", self._address)
+            except asyncio.CancelledError:
+                # Task cancellation arrived while the disconnect was in
+                # flight.  The shield kept it running; give it one more
+                # bounded wait, then honor the cancellation below.
+                if not cancelled and not disconnect.done():
+                    cancelled = True
+                    continue
+                cancelled = True
+            except asyncio.TimeoutError:
+                disconnect.cancel()
+                logger.debug("[%s] Disconnect timed out", self._address)
             except Exception:
-                logger.debug("[%s] Disconnect failed", self._address, exc_info=True)
-            self._client = None
+                logger.debug("[%s] Disconnect failed", self._address,
+                             exc_info=True)
+            break
+        if cancelled:
+            if not disconnect.done():
+                disconnect.cancel()
+            raise asyncio.CancelledError
 
     # ── Passcode handshake ────────────────────────────────────────────
 
