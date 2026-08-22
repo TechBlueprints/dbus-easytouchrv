@@ -91,6 +91,23 @@ else
 fi
 echo ""
 
+# Step 2b: Converge the shared BCM checkout (fleet-wide BLE stack).
+# Idempotent and forward-only: ff-only means a stale installer can never
+# move the fleet backwards.  Its install.sh smoke-imports the stack and
+# only then updates the /data/bcm/python3 shim the run script prefers.
+echo "Step 2b: Shared bleak-connection-manager install..."
+BCM_DIR=/data/bcm
+if [ -d "$BCM_DIR/.git" ]; then
+    git -C "$BCM_DIR" fetch -q origin && git -C "$BCM_DIR" merge -q --ff-only origin/main
+else
+    git clone -q https://github.com/TechBlueprints/bleak-connection-manager "$BCM_DIR"
+fi
+if ! "$BCM_DIR/install.sh"; then
+    echo "Error: shared BCM install failed; see output above (rollback: git -C $BCM_DIR checkout <hash> && $BCM_DIR/install.sh)"
+    exit 1
+fi
+echo ""
+
 # Step 3: Initialize submodules (velib_python + BLE stack)
 echo "Step 3: Setting up submodules..."
 cd "$INSTALL_DIR"

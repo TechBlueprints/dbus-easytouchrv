@@ -31,21 +31,8 @@ import os
 import re
 import sys
 
-# Make the bundled BLE stack importable when run from the repo.
-# bleak-connection-manager/ext carries dbus-fast 5.x, shadowing Venus OS's
-# older site-packages copy (current bleak requires dbus-fast>=4).
-_ext = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
-for _sub in [
-    os.path.join(_ext, "bleak-connection-manager", "src"),
-    os.path.join(_ext, "bleak-connection-manager", "ext"),
-    os.path.join(_ext, "bleak-retry-connector", "src"),
-    os.path.join(_ext, "bluetooth-adapters", "src"),
-    os.path.join(_ext, "aiooui", "src"),
-    os.path.join(_ext, "bleak"),
-]:
-    if os.path.isdir(_sub) and _sub not in sys.path:
-        sys.path.insert(0, _sub)
-
+# The BLE stack comes from the shared /data/bcm shim when this runs under
+# it, with the vendored ext/ fallback handled inside catcher_setup.
 # Installed before easytouch_ble captures bleak's classes at import time.
 # On non-Linux hosts the catcher's claims/mgmt layers degrade to no-ops.
 from catcher_setup import install_catcher_from_config  # noqa: E402

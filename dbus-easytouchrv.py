@@ -68,24 +68,11 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-# Add ext folders to sys.path
+# Add ext folders to sys.path (velib_python is service-specific and always
+# vendored; the BLE stack comes from the shared /data/bcm shim when present,
+# with the vendored ext/ fallback handled inside catcher_setup).
 _ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
 sys.path.insert(1, os.path.join(_ext_dir, "velib_python"))
-
-# All BLE dependencies from local ext/ submodules (upstream repos).
-# bleak-connection-manager/ext carries dbus-fast 5.x (pure Python), which
-# must shadow Venus OS's site-packages dbus-fast 2.21.1: current bleak
-# requires dbus-fast>=4 (dbus_fast.annotations).
-for _sub in [
-    os.path.join(_ext_dir, "bleak-connection-manager", "src"),
-    os.path.join(_ext_dir, "bleak-connection-manager", "ext"),
-    os.path.join(_ext_dir, "bleak-retry-connector", "src"),
-    os.path.join(_ext_dir, "bluetooth-adapters", "src"),
-    os.path.join(_ext_dir, "aiooui", "src"),
-    os.path.join(_ext_dir, "bleak"),
-]:
-    if os.path.isdir(_sub) and _sub not in sys.path:
-        sys.path.insert(0, _sub)
 
 from vedbus import VeDbusService  # noqa: E402
 from settingsdevice import SettingsDevice  # noqa: E402
