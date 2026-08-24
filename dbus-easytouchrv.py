@@ -972,13 +972,44 @@ class ThermostatDevice:
         svc["/Status"] = SENSOR_OK if temp_f is not None else SENSOR_DISCONNECTED
 
     def set_disconnected(self):
+        """Mark every published value as no-longer-live.
+
+        /Status alone is not enough: a consumer (VRM, Node-RED, a dashboard)
+        that reads /Connected and /Temperature sees a connected sensor still
+        reporting its last good reading, which is indistinguishable from a
+        steady one -- a frozen value was mistaken for a live one for 70
+        minutes in the field.  So the values are cleared and /Connected is
+        dropped on every service this device owns, which is the standard
+        Venus signal that the driver is not talking to the hardware.
+        """
         self._temp["/Status"] = SENSOR_DISCONNECTED
+        self._set(self._temp, "/Connected", 0)
+        for path in ("/Temperature", "/OutsideTemperature",
+                     "/FaceplateTemperature", "/RoomSensorTemperature",
+                     "/WeatherTemperature", "/Voltage"):
+            self._set(self._temp, path, None)
+        self._set(self._temp, "/RunningState", "")
         for svc in self._aux.values():
             svc["/Status"] = SENSOR_DISCONNECTED
+            svc["/Temperature"] = None
+            self._set(svc, "/Connected", 0)
+        self._set(self._switch, "/Connected", 0)
+        self._set(self._switch, "/ModuleVoltage", None)
+        if self._freeze_input is not None:
+            self._set(self._freeze_input, "/Connected", 0)
         if self._outputs_created:
             for output in ("mode", "fan", "cool", "heat"):
                 self._set(self._switch, self._out(output, "Status"),
                           SW_STATUS_DISABLED)
+
+    def set_connected(self):
+        """Re-raise /Connected on every service after a successful poll."""
+        self._set(self._temp, "/Connected", 1)
+        for svc in self._aux.values():
+            self._set(svc, "/Connected", 1)
+        self._set(self._switch, "/Connected", 1)
+        if self._freeze_input is not None:
+            self._set(self._freeze_input, "/Connected", 1)
 
 
 # ── Manager ───────────────────────────────────────────────────────────────────
@@ -1258,6 +1289,7 @@ class EasyTouchManager:
                 logger.exception("[%s] Failed to apply config", dev_id)
         if snap.status is not None:
             try:
+                dev.set_connected()
                 dev.apply_status(snap.status)
             except Exception:
                 logger.exception("[%s] Failed to apply status", dev_id)

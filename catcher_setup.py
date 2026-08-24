@@ -87,6 +87,29 @@ def catcher_options() -> tuple[list[str], dict[str, int]]:
     return adapters, link_caps
 
 
+def _tune_conn_params() -> bool:
+    """Whether to let the catcher tune BLE connection parameters.
+
+    Default OFF for this driver.  The catcher's habluetooth-derived tuning
+    loads a 7.5 ms connect interval, relaxing to 8.75-11.25 ms with an 8 s
+    supervision timeout.  That is tuned for battery BMS links; an EasyTouch
+    thermostat is a low-rate device polled every 10 s, so the aggressive
+    interval buys nothing, while the short supervision timeout drops the
+    link on any marginal RF moment.  Enable with `tune_conn_params = true`
+    in config.ini if a deployment wants it.
+    """
+    cfg = configparser.ConfigParser()
+    config_dir = os.path.dirname(os.path.abspath(__file__))
+    for name in ("config.ini", "config.default.ini"):
+        path = os.path.join(config_dir, name)
+        if os.path.exists(path):
+            cfg.read(path)
+            break
+    defaults = cfg["DEFAULT"] if "DEFAULT" in cfg else {}
+    return str(defaults.get("tune_conn_params", "false")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def install_catcher_from_config(owner: str) -> None:
     """Install the bleak catcher with the configured adapter routing."""
     _ensure_ble_stack()
@@ -98,4 +121,5 @@ def install_catcher_from_config(owner: str) -> None:
         adapters=adapters,
         link_caps=link_caps,
         wrap_scanner=True,
+        tune_conn_params=_tune_conn_params(),
     )

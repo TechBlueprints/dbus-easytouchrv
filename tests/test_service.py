@@ -833,5 +833,50 @@ class DispatchRateLimitTests(unittest.TestCase):
         self.assertEqual(self.mgr.dispatched[-1][1], {"cool_sp": 73})
 
 
+class StaleValueTests(unittest.TestCase):
+    """A device we cannot reach must not look like a live one.
+
+    In the field an unreachable thermostat held /Connected=1 and its last
+    good readings for 70 minutes; four independent fields sat frozen to
+    0.1 degC while an independent sensor showed the real value 18 degC
+    away.  Nothing a consumer could read distinguished stale from steady.
+    """
+
+    def setUp(self):
+        self.mgr = FakeManager()
+        self.dev = driver.ThermostatDevice(
+            self.mgr, "AA:BB:CC:DD:EE:FF", "Test A/C", 0, "", 150)
+        cfg = driver.ZoneConfig(zone=0)
+        cfg.available_modes = 0x7
+        cfg.fan_array = [0] * 16
+        self.dev.apply_config(cfg)
+
+    def test_disconnect_clears_values_and_connected(self):
+        temp = self.dev._temp
+        temp.values["/Temperature"] = 25.6
+        temp.values["/OutsideTemperature"] = 20.0
+        temp.values["/Connected"] = 1
+        self.dev.set_disconnected()
+        self.assertEqual(temp.values["/Connected"], 0)
+        self.assertIsNone(temp.values["/Temperature"])
+        self.assertIsNone(temp.values["/OutsideTemperature"])
+        self.assertEqual(temp.values["/Status"], driver.SENSOR_DISCONNECTED)
+        self.assertEqual(self.dev._switch.values["/Connected"], 0)
+
+    def test_reconnect_raises_connected_again(self):
+        self.dev.set_disconnected()
+        self.dev.set_connected()
+        self.assertEqual(self.dev._temp.values["/Connected"], 1)
+        self.assertEqual(self.dev._switch.values["/Connected"], 1)
+
+    def test_aux_sensors_also_cleared(self):
+        self.dev._apply_aux("incoil", "in coil", 1, 12)
+        aux = self.dev._aux["incoil"]
+        self.assertIsNotNone(aux.values["/Temperature"])
+        self.dev.set_disconnected()
+        self.assertIsNone(aux.values["/Temperature"])
+        self.assertEqual(aux.values["/Connected"], 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

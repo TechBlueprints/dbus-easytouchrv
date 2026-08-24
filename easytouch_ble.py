@@ -56,6 +56,36 @@ from bleak_connection_manager.validators import (
 
 logger = logging.getLogger(__name__)
 
+
+def _brief(exc: BaseException) -> str:
+    """One-line rendering of an exception, for expected failures."""
+    return "%s: %s" % (type(exc).__name__, exc)
+
+
+# Error signatures that mean this client's link is unusable for good: BlueZ
+# has torn the link down, or bleak's per-client D-Bus socket is already
+# closed (its fd shows up as EBADF / "is not registered" from the selector).
+# Retrying an exchange after one of these can never succeed, and every extra
+# retry keeps a dead client -- and its D-Bus connection -- alive longer.
+_LINK_GONE_MARKERS = (
+    "not connected",
+    "bad file descriptor",
+    "is not registered",
+    "disconnected",
+    "no reply",
+)
+
+
+def _is_link_gone(exc: BaseException) -> bool:
+    """True when ``exc`` means the link (or its bus) is definitively dead."""
+    if isinstance(exc, (OSError, KeyError)):
+        # EBADF from a closed bus socket, or the selector KeyError that
+        # precedes it; both are raised straight out of dbus-fast's writer.
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _LINK_GONE_MARKERS)
+
+
 # ── Vendor GATT UUIDs ─────────────────────────────────────────────────────────
 
 SERVICE_UUID  = "000000ff-0000-1000-8000-00805f9b34fb"
@@ -866,7 +896,21 @@ class EasyTouchSession:
             # link).  MTU stays at 23 on BlueZ; plain write commands with the
             # full payload are accepted (verified on GE 347 units).
             await self._client.write_gatt_char(CMD_UUID, payload, response=False)
-        except Exception:
+        except Exception as exc:
+            if _is_link_gone(exc):
+                # The link is definitively down: BlueZ says "Not connected",
+                # or bleak's per-client D-Bus socket is already closed.  No
+                # further exchange on this client can succeed, so end the
+                # session now instead of burning two more poll timeouts --
+                # each retained client holds a D-Bus connection, and the
+                # system bus has a per-UID ceiling.  One line, not a stack:
+                # this is an expected condition, and a traceback per failed
+                # write rotates the log's own evidence away within minutes.
+                logger.warning("[%s] Link gone during %s: %s",
+                               self._address, command.get("Type"),
+                               _brief(exc))
+                raise ConnectionError(
+                    "[%s] Link gone: %s" % (self._address, _brief(exc)))
             logger.exception("[%s] Command write failed: %s",
                              self._address, command.get("Type"))
             return None
@@ -877,7 +921,13 @@ class EasyTouchSession:
         while time.monotonic() < deadline:
             try:
                 raw = await self._client.read_gatt_char(RETURN_UUID)
-            except Exception:
+            except Exception as exc:
+                if _is_link_gone(exc):
+                    logger.warning("[%s] Link gone reading reply to %s: %s",
+                                   self._address, command.get("Type"),
+                                   _brief(exc))
+                    raise ConnectionError(
+                        "[%s] Link gone: %s" % (self._address, _brief(exc)))
                 logger.debug("[%s] Return read failed, retrying",
                              self._address, exc_info=True)
                 await asyncio.sleep(0.3)

@@ -447,5 +447,64 @@ class StaleLinkSweepTests(unittest.TestCase):
         self.assertIs(result, False)
 
 
+class LinkGoneTests(unittest.TestCase):
+    """A dead link must end the session at once, quietly.
+
+    Each retained client holds its own D-Bus connection (bleak's BlueZ
+    backend builds a MessageBus per client), and the system bus has a
+    per-UID ceiling -- 152 of prod's 256 were held by this driver once a
+    reconnect loop started.  Two extra 6s poll timeouts per cycle kept a
+    dead client alive that much longer and wrote a full traceback each
+    time, which rotated the log's own evidence away in minutes.
+    """
+
+    def run_async(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_classifies_dead_link_errors(self):
+        for exc in (OSError(9, "Bad file descriptor"),
+                    KeyError("152 is not registered"),
+                    Exception("[org.bluez.Error.Failed] Not connected"),
+                    Exception("Disconnected early")):
+            self.assertTrue(et._is_link_gone(exc), exc)
+
+    def test_keeps_ordinary_errors_retryable(self):
+        for exc in (ValueError("bad payload"),
+                    Exception("[org.bluez.Error.Failed] Unlikely error")):
+            self.assertFalse(et._is_link_gone(exc), exc)
+
+    def _session_with_client(self, client):
+        s = et.EasyTouchSession("AA:BB:CC:DD:EE:FF")
+        s._client = client
+        return s
+
+    def test_write_failure_on_dead_link_raises(self):
+        class DeadWrite:
+            async def write_gatt_char(self, *a, **k):
+                raise OSError(9, "Bad file descriptor")
+        s = self._session_with_client(DeadWrite())
+        with self.assertRaises(ConnectionError):
+            self.run_async(s._exchange({"Type": "Get Status"}))
+
+    def test_read_failure_on_dead_link_raises(self):
+        class DeadRead:
+            async def write_gatt_char(self, *a, **k):
+                return None
+            async def read_gatt_char(self, *a, **k):
+                raise Exception("[org.bluez.Error.Failed] Not connected")
+        s = self._session_with_client(DeadRead())
+        with self.assertRaises(ConnectionError):
+            self.run_async(s._exchange({"Type": "Get Status"}))
+
+    def test_ordinary_write_failure_still_returns_none(self):
+        """A non-link error keeps the old behaviour: no session teardown."""
+        class OddWrite:
+            async def write_gatt_char(self, *a, **k):
+                raise ValueError("bad payload")
+        s = self._session_with_client(OddWrite())
+        self.assertIsNone(
+            self.run_async(s._exchange({"Type": "Get Status"})))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
