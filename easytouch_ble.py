@@ -793,6 +793,52 @@ class EasyTouchSession:
 
         return self
 
+    def _close_orphaned_bus(self) -> bool:
+        """Close bleak's per-session D-Bus connection if disconnect left it open.
+
+        bleak's BlueZ backend opens a MessageBus per connection session
+        (client.py: "Each BLE connection session needs a new D-Bus
+        connection...") and closes it at the END of disconnect().  When the
+        device is already gone, the Disconnect call's ``assert_reply``
+        raises first -- our exact "[org.bluez.Error.Failed] Not connected"
+        -- so that close is never reached; disconnect()'s ``finally`` only
+        clears the disconnecting event.  ``_cleanup_all()`` does not close
+        it either: despite promising to "free all the allocated resource in
+        DBus", it removes the device watcher, nulls ``services``, and leaves
+        ``_bus`` attached and non-None.  A cancelled/timed-out disconnect
+        strands it the same way.
+
+        The result is one leaked system-bus connection per failed session,
+        permanently.  Measured on the production Cerbo: exactly +1 D-Bus
+        connection per retry attempt, until 152 of the bus's 256 per-UID
+        connections were held and NO process on the box could open a new
+        one -- which took both battery BMS links down with it.
+
+        Reaching into bleak's internals is deliberate: this is an upstream
+        defect we cannot wait on, and the alternative is re-exhausting the
+        host bus.  Everything is getattr-guarded so a bleak that fixes or
+        renames this degrades to a no-op rather than breaking the session.
+        Returns True when a bus was actually closed.
+        """
+        backend = getattr(self._client, "_backend", None)
+        bus = getattr(backend, "_bus", None)
+        if bus is None:
+            return False
+        try:
+            bus.disconnect()          # shuts the socket down; sync in dbus-fast
+        except Exception:
+            logger.debug("[%s] Orphaned bus close failed", self._address,
+                         exc_info=True)
+            return False
+        finally:
+            try:
+                backend._bus = None   # so bleak's own paths see it as closed
+            except Exception:
+                pass
+        logger.debug("[%s] Closed orphaned per-session D-Bus connection",
+                     self._address)
+        return True
+
     async def __aexit__(self, *exc: object) -> None:
         if self._client is None:
             return
@@ -828,6 +874,16 @@ class EasyTouchSession:
                 logger.debug("[%s] Disconnect failed", self._address,
                              exc_info=True)
             break
+        # Runs on EVERY exit path -- clean, failed, timed out or cancelled.
+        # A clean disconnect has already nulled the backend's bus, so this
+        # is a no-op then; the paths that matter are the ones where the
+        # device was already gone and bleak's own close was skipped.  Held
+        # against ``client`` rather than self._client, which is None by now.
+        self._client = client
+        try:
+            self._close_orphaned_bus()
+        finally:
+            self._client = None
         if cancelled:
             if not disconnect.done():
                 disconnect.cancel()

@@ -542,5 +542,67 @@ class BackoffTests(unittest.TestCase):
                          "backoff reset on connect: %r" % attempts)
 
 
+class OrphanedBusTests(unittest.TestCase):
+    """bleak leaks its per-session D-Bus connection on an abnormal drop.
+
+    bleak's BlueZ backend opens a MessageBus per connection session and
+    closes it at the END of disconnect().  If the device is already gone,
+    assert_reply raises first and that close is never reached, and
+    _cleanup_all() leaves _bus attached despite its docstring.  Measured on
+    prod: +1 system-bus connection per retry, until 152 of 256 were held
+    and the whole box could not open a new connection.
+    """
+
+    def run_async(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def _client(self, disconnect_exc=None, bus_present=True):
+        class Bus:
+            def __init__(self):
+                self.closed = False
+            def disconnect(self):
+                self.closed = True
+
+        class Backend:
+            pass
+
+        class Client:
+            def __init__(self):
+                self._backend = Backend()
+                self._backend._bus = Bus() if bus_present else None
+            async def disconnect(self):
+                if disconnect_exc is not None:
+                    raise disconnect_exc
+        return Client()
+
+    def test_closes_bus_when_disconnect_raises(self):
+        """The device-already-gone path: bleak skips its own close."""
+        client = self._client(
+            disconnect_exc=Exception("[org.bluez.Error.Failed] Not connected"))
+        s = et.EasyTouchSession("AA:BB:CC:DD:EE:FF")
+        s._client = client
+        bus = client._backend._bus
+        self.run_async(s.__aexit__())
+        self.assertTrue(bus.closed, "orphaned bus was not closed")
+        self.assertIsNone(client._backend._bus)
+
+    def test_no_op_when_bleak_already_closed_it(self):
+        """A clean disconnect nulls _bus; we must not double-close."""
+        client = self._client(bus_present=False)
+        s = et.EasyTouchSession("AA:BB:CC:DD:EE:FF")
+        s._client = client
+        self.run_async(s.__aexit__())
+        self.assertIsNone(client._backend._bus)
+
+    def test_degrades_when_internals_absent(self):
+        """A bleak without _backend/_bus must not break the session exit."""
+        class Bare:
+            async def disconnect(self):
+                return None
+        s = et.EasyTouchSession("AA:BB:CC:DD:EE:FF")
+        s._client = Bare()
+        self.run_async(s.__aexit__())   # must not raise
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
