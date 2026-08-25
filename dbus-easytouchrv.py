@@ -260,12 +260,45 @@ def c_to_f(c: float | None) -> int | None:
     return int(round(c * 9.0 / 5.0 + 32.0))
 
 
+# The thread that imports this module is the one that runs the GLib
+# mainloop (main() below).  Every dbus-python object in this process must
+# belong to it: dbus-python's DBusGMainLoop supports only the DEFAULT GLib
+# main context, so a connection built on a worker thread still attaches its
+# watches to the mainloop's context -- private=True does NOT isolate it.
+# Two sibling services on this fleet crashed for weeks in
+# dbus_connection_dispatch / dbus_message_iter_append_basic exactly this way.
+_MAINLOOP_THREAD = threading.current_thread()
+
+
+def _assert_mainloop_thread(what: str) -> None:
+    """Refuse to build a dbus-python object off the mainloop thread.
+
+    This driver is safe today only because every construction site is
+    reached from main -- including ``_apply_aux``, which builds a bus at
+    RUNTIME and is reached from a BLE callback, safe purely because
+    ``_make_snapshot_handler`` marshals through ``GLib.idle_add``.  That is
+    a property of the choke point, not of the call site, so it can be
+    broken silently by a future change that calls one of these directly
+    from the asyncio thread.  Failing loudly here beats a segfault inside
+    libdbus later, which is how this class of bug presents.
+    """
+    current = threading.current_thread()
+    if current is not _MAINLOOP_THREAD:
+        raise RuntimeError(
+            "%s attempted on thread %r; dbus-python belongs to the mainloop "
+            "thread (%r).  Marshal via GLib.idle_add instead."
+            % (what, current.name, _MAINLOOP_THREAD.name))
+
+
 def new_private_bus():
     """A private bus connection.
 
     Every VeDbusService exports its object tree from '/' on its connection,
     so each service needs its own connection or the object paths collide.
+    Note this is a path-collision measure, NOT thread isolation: private
+    connections still attach their watches to the default GLib context.
     """
+    _assert_mainloop_thread("private bus construction")
     if "DBUS_SESSION_BUS_ADDRESS" in os.environ:
         return dbus.SessionBus(private=True)
     return dbus.SystemBus(private=True)
@@ -1044,6 +1077,13 @@ class EasyTouchManager:
         self._settings: SettingsDevice | None = None
         self._device_setting_items: dict[str, dict] = {}      # dev_id -> items
         try:
+            # SettingsDevice never builds a bus -- it takes ours and calls
+            # add_signal_receiver on it, so it is thread-affinity
+            # TRANSPARENT, not safe: hand it a worker-thread connection and
+            # the receivers land with the wrong affinity and nothing in
+            # SettingsDevice catches it.  Safe here purely because this runs
+            # on the mainloop thread, which the guard now enforces.
+            _assert_mainloop_thread("SettingsDevice construction")
             self._settings = SettingsDevice(
                 dbus.SystemBus() if "DBUS_SESSION_BUS_ADDRESS" not in os.environ
                 else dbus.SessionBus(),

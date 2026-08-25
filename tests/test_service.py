@@ -878,5 +878,47 @@ class StaleValueTests(unittest.TestCase):
         self.assertEqual(aux.values["/Connected"], 0)
 
 
+class MainloopThreadGuardTests(unittest.TestCase):
+    """dbus-python objects must only ever be built on the mainloop thread.
+
+    private=True does NOT isolate: DBusGMainLoop supports only the default
+    GLib context, so a connection built on a worker still attaches its
+    watches to the mainloop's context.  Two sibling services on this fleet
+    crashed for weeks in dbus_connection_dispatch this way.  The driver is
+    safe because every construction site is reached from main -- including
+    _apply_aux, which builds a bus at runtime and is reached from a BLE
+    callback, safe purely because the snapshot handler marshals through
+    GLib.idle_add.  These tests keep that from regressing silently.
+    """
+
+    def test_bus_construction_allowed_on_mainloop_thread(self):
+        self.assertIsNotNone(driver.new_private_bus())
+
+    def test_bus_construction_refused_off_thread(self):
+        import threading
+        box = {}
+
+        def worker():
+            try:
+                driver.new_private_bus()
+                box["result"] = "built a bus off-thread"
+            except RuntimeError as e:
+                box["error"] = str(e)
+
+        t = threading.Thread(target=worker, name="BLE_worker")
+        t.start()
+        t.join()
+        self.assertNotIn("result", box, box.get("result"))
+        self.assertIn("BLE_worker", box.get("error", ""))
+
+    def test_aux_sensor_creation_is_the_runtime_path(self):
+        """_apply_aux builds a bus at runtime; prove it works from main."""
+        mgr = FakeManager()
+        dev = driver.ThermostatDevice(
+            mgr, "AA:BB:CC:DD:EE:FF", "Test A/C", 0, "", 150)
+        dev._apply_aux("incoil", "in coil", 1, 55)
+        self.assertIn("incoil", dev._aux)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
