@@ -835,8 +835,17 @@ class EasyTouchSession:
                 backend._bus = None   # so bleak's own paths see it as closed
             except Exception:
                 pass
-        logger.debug("[%s] Closed orphaned per-session D-Bus connection",
-                     self._address)
+        # INFO, not debug, and deliberately: once BCM's central fix
+        # (e876947) is deployed this should NEVER fire, because the catcher
+        # closes the session bus in its own disconnect() finally.  Every
+        # occurrence after that is evidence of an exit path the library fix
+        # does not cover -- which is exactly what a silent local workaround
+        # would hide.  This turns the redundancy into a measurement: if the
+        # line stays absent across many failed sessions, this workaround can
+        # be dropped; if it appears, the gap it names is real.
+        logger.info("[%s] Closed orphaned per-session D-Bus connection that "
+                    "bleak left attached (BCM's own close did not run)",
+                    self._address)
         return True
 
     async def __aexit__(self, *exc: object) -> None:
