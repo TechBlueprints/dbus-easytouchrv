@@ -506,5 +506,41 @@ class LinkGoneTests(unittest.TestCase):
             self.run_async(s._exchange({"Type": "Get Status"})))
 
 
+class BackoffTests(unittest.TestCase):
+    """Backoff must survive a unit that connects and instantly drops.
+
+    Field case: 'AC Front' accepted every connection and failed the next
+    GATT call ~33 ms later.  Resetting the backoff on connect meant it
+    retried every 30 s indefinitely -- 66 cycles/hour, each leaking a
+    D-Bus connection, until the system bus hit its per-UID ceiling.
+    """
+
+    def setUp(self):
+        reset_fake()
+
+    def run_async(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_backoff_grows_when_connect_succeeds_but_polls_fail(self):
+        class InstantDropSession(FakeSession):
+            async def get_status(self, zone):
+                return None
+
+        snapshots = []
+        with self.assertLogs("easytouch_ble", level="INFO") as caught:
+            self.run_async(run_monitor_cycles(
+                snapshots, 7, session_factory=InstantDropSession,
+                settings=et.MonitorSettings(
+                    persistent=True, poll_seconds=0.001,
+                    diagnostics_seconds=0.0,
+                    reconnect_base=0.001, reconnect_max=0.05)))
+
+        attempts = [int(m.rsplit("attempt ", 1)[1].rstrip(")"))
+                    for m in caught.output if "Reconnecting in" in m]
+        self.assertGreaterEqual(len(attempts), 2, caught.output)
+        self.assertEqual(attempts[:2], [1, 2],
+                         "backoff reset on connect: %r" % attempts)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

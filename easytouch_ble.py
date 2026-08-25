@@ -1177,7 +1177,14 @@ async def run_device_monitor(
     while True:
         try:
             async with session_factory(address, passcode) as s:
-                backoff_attempt = 0
+                # NB: the backoff is NOT reset here.  A unit that accepts the
+                # connection and drops it milliseconds later (seen in the
+                # field: connect, then "Not connected" on the very next GATT
+                # call) would otherwise reset the backoff on every cycle and
+                # spin at reconnect_base forever.  Each cycle costs a BLE
+                # connect, a scan, and -- until bleak closes its per-client
+                # bus on an abnormal drop -- a D-Bus connection.  The reset
+                # belongs after a poll that actually returned data.
                 prefix = model_prefix or model_prefix_from_name(s.ble_name)
                 cfg = await s.get_config(zone)
                 first_cycle = True
@@ -1222,6 +1229,10 @@ async def run_device_monitor(
                                 % missed)
                     else:
                         missed = 0
+                        # A poll that returned data is the only proof the
+                        # link is genuinely usable, so this -- not the
+                        # connect -- is where the backoff resets.
+                        backoff_attempt = 0
 
                     if not settings.persistent:
                         break
