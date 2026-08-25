@@ -604,5 +604,82 @@ class OrphanedBusTests(unittest.TestCase):
         self.run_async(s.__aexit__())   # must not raise
 
 
+class PhantomConnectTests(unittest.TestCase):
+    """A phantom connect must clear BlueZ state before the next attempt.
+
+    Field case, 21 hours: a BlueZ Device1 object for AC Front sat stuck
+    Connected=true on hci1 with NO ACL link on any adapter.  bleak's
+    connect() believes that property, returns success, and falls back to
+    the default MTU of 23 -- so "Connected (MTU: 23)" appeared in the log
+    exactly like a real connection while every GATT call failed "Not
+    connected" ~33 ms later.  The old sweep never ran because it only
+    triggered when the device could not be FOUND, and a phantom is
+    perfectly findable.
+    """
+
+    def setUp(self):
+        et._phantom_connects.clear()
+
+    def tearDown(self):
+        et._phantom_connects.clear()
+
+    def run_async(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_link_gone_marks_the_address(self):
+        class DeadWrite:
+            async def write_gatt_char(self, *a, **k):
+                raise Exception("[org.bluez.Error.Failed] Not connected")
+        s = et.EasyTouchSession("AA:BB:CC:DD:EE:FF")
+        s._client = DeadWrite()
+        with self.assertRaises(ConnectionError):
+            self.run_async(s._exchange({"Type": "Get Config"}))
+        self.assertTrue(et._phantom_connects.get("AA:BB:CC:DD:EE:FF"))
+
+    def test_sweep_runs_before_scanning_after_a_phantom(self):
+        et._phantom_connects["AA:BB:CC:DD:EE:FF"] = True
+        swept = []
+
+        async def fake_sweep(address, *a, **k):
+            swept.append(address)
+            return True
+
+        real = et.disconnect_stale_link
+        et.disconnect_stale_link = fake_sweep
+        try:
+            s = et.EasyTouchSession("AA:BB:CC:DD:EE:FF")
+            try:
+                self.run_async(s.__aenter__())
+            except Exception:
+                pass          # no radio in tests; the sweep is the assertion
+        finally:
+            et.disconnect_stale_link = real
+        self.assertEqual(swept, ["AA:BB:CC:DD:EE:FF"])
+
+    def test_no_sweep_when_no_phantom_recorded(self):
+        swept = []
+
+        async def fake_sweep(address, *a, **k):
+            swept.append(address)
+            return True
+
+        real = et.disconnect_stale_link
+        et.disconnect_stale_link = fake_sweep
+        try:
+            s = et.EasyTouchSession("AA:BB:CC:DD:EE:FF")
+            try:
+                self.run_async(s.__aenter__())
+            except Exception:
+                pass
+        finally:
+            et.disconnect_stale_link = real
+        self.assertEqual(swept, [])
+
+    def test_live_data_clears_phantom_state(self):
+        et._phantom_connects["AA:BB:CC:DD:EE:FF"] = True
+        et.note_link_alive("aa:bb:cc:dd:ee:ff")
+        self.assertNotIn("AA:BB:CC:DD:EE:FF", et._phantom_connects)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

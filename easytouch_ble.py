@@ -76,6 +76,22 @@ _LINK_GONE_MARKERS = (
 )
 
 
+# Addresses whose last session "connected" and then failed its first GATT
+# call -- the phantom signature (a BlueZ device object stuck Connected=true
+# with no ACL link).  Keyed by MAC; set on a link-gone exchange, cleared by
+# a poll that returns data.  Drives the pre-connect BlueZ sweep.
+_phantom_connects: dict = {}
+
+
+def _key(address: str) -> str:
+    return str(address).strip().upper()
+
+
+def note_link_alive(address: str) -> None:
+    """Record that this address returned real data (clears phantom state)."""
+    _phantom_connects.pop(_key(address), None)
+
+
 def _is_link_gone(exc: BaseException) -> bool:
     """True when ``exc`` means the link (or its bus) is definitively dead."""
     if isinstance(exc, (OSError, KeyError)):
@@ -700,10 +716,71 @@ async def disconnect_stale_link(address: str, timeout: float = 10.0) -> bool:
                                address, path, reply.error_name, reply.body)
             else:
                 dropped = True
+                continue
+            if await _forget_device(address, path, manager, timeout):
+                dropped = True
         return dropped
+    except asyncio.TimeoutError:
+        # bluetoothd took the call and never answered.  Seen in the field:
+        # a device object stuck Connected=true whose Disconnect AND
+        # RemoveDevice both hang, while cached property reads answer
+        # instantly -- bluetoothd serving cache but blocked on anything
+        # touching that controller.  Nothing this driver can send will fix
+        # it, so say what will, loudly, and name the adapter.
+        logger.error(
+            "[%s] BlueZ did not answer the stale-link disconnect within "
+            "%.0fs. Its device object is wedged and every connect will "
+            "'succeed' without a link. Remedy is an adapter bounce "
+            "(hciconfig <hciN> down; hciconfig <hciN> up) on the adapter in "
+            "the device path above.", address, timeout)
+        return False
     except Exception:
         logger.debug("[%s] Stale-link sweep failed", address, exc_info=True)
         return False
+
+
+async def _forget_device(address: str, path: str, manager,
+                         timeout: float) -> bool:
+    """Ask the adapter to forget a device object Disconnect could not clear.
+
+    Device1.Disconnect only tears a link down; it cannot remove an object
+    whose state is already inconsistent.  Adapter1.RemoveDevice drops the
+    object entirely, which is what clears a phantom Connected=true.  The
+    adapter path is the device path minus its last element.
+    """
+    try:
+        from bleak.backends.bluezdbus import defs
+        from dbus_fast import Message, MessageType
+    except Exception:
+        return False
+    adapter_path = path.rsplit("/", 1)[0]
+    logger.warning("[%s] Disconnect did not clear %s; asking %s to forget it",
+                   address, path, adapter_path)
+    try:
+        reply = await asyncio.wait_for(
+            manager._bus.call(
+                Message(
+                    destination=defs.BLUEZ_SERVICE,
+                    path=adapter_path,
+                    interface=defs.ADAPTER_INTERFACE,
+                    member="RemoveDevice",
+                    signature="o",
+                    body=[path],
+                )
+            ),
+            timeout,
+        )
+    except asyncio.TimeoutError:
+        raise
+    except Exception:
+        logger.debug("[%s] RemoveDevice failed on %s", address, path,
+                     exc_info=True)
+        return False
+    if reply is not None and reply.message_type == MessageType.ERROR:
+        logger.warning("[%s] BlueZ refused RemoveDevice on %s: %s",
+                       address, path, reply.error_name)
+        return False
+    return True
 
 
 # ── Transient BLE session ─────────────────────────────────────────────────────
@@ -745,6 +822,21 @@ class EasyTouchSession:
         self.ble_name: str = ""    # advertised name captured during scanning
 
     async def __aenter__(self) -> "EasyTouchSession":
+        if _phantom_connects.get(_key(self._address)):
+            # The previous attempt "connected" and then failed its very
+            # first GATT call with "Not connected".  That is a phantom: a
+            # BlueZ device object stuck Connected=true with no ACL link
+            # behind it, which bleak's connect() believes (it returns
+            # success on the property and falls back to the default MTU of
+            # 23, so the log line looks exactly like a real connection).
+            # Every GATT call then fails forever.  Observed on prod for 21
+            # hours.  Clear the object BEFORE scanning; the sweep already
+            # matches on Connected=true, it simply never used to run in
+            # this case because the device IS findable.
+            logger.warning("[%s] Previous connect was a phantom (no link "
+                           "behind it); clearing BlueZ state first",
+                           self._address)
+            await disconnect_stale_link(self._address)
         logger.info("[%s] Scanning...", self._address)
         device = None
         for attempt in range(self.FIND_ATTEMPTS):
@@ -974,6 +1066,7 @@ class EasyTouchSession:
                 logger.warning("[%s] Link gone during %s: %s",
                                self._address, command.get("Type"),
                                _brief(exc))
+                _phantom_connects[_key(self._address)] = True
                 raise ConnectionError(
                     "[%s] Link gone: %s" % (self._address, _brief(exc)))
             logger.exception("[%s] Command write failed: %s",
@@ -991,6 +1084,7 @@ class EasyTouchSession:
                     logger.warning("[%s] Link gone reading reply to %s: %s",
                                    self._address, command.get("Type"),
                                    _brief(exc))
+                    _phantom_connects[_key(self._address)] = True
                     raise ConnectionError(
                         "[%s] Link gone: %s" % (self._address, _brief(exc)))
                 logger.debug("[%s] Return read failed, retrying",
@@ -1294,6 +1388,7 @@ async def run_device_monitor(
                                 % missed)
                     else:
                         missed = 0
+                        note_link_alive(address)
                         # A poll that returned data is the only proof the
                         # link is genuinely usable, so this -- not the
                         # connect -- is where the backoff resets.
