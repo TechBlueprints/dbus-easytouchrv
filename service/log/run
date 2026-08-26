@@ -1,3 +1,13 @@
 #!/bin/sh
 exec 2>&1
-exec multilog t s25000 n4 /var/log/dbus-easytouchrv
+# 20 x 1.5 MB = 30 MB of history on /data (not tmpfs), which costs disk but
+# NOT write volume -- multilog writes the same bytes either way, it just
+# keeps more of them.
+#
+# Sized against INCIDENT rate, not idle rate, because retention collapses
+# exactly when it becomes valuable: the old s25000 n4 (100 kB) held ~17 h
+# of a healthy driver but only MINUTES during the reconnect flood, and a
+# phantom-connect window was lost by 37 minutes when we went looking for
+# it.  At the ~350 B/s seen during that flood this holds ~24 h; at the
+# idle rate of a healthy driver it holds months.
+exec multilog t s1500000 n20 /var/log/dbus-easytouchrv
