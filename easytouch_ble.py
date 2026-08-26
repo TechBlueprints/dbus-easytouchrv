@@ -817,6 +817,15 @@ class EasyTouchSession:
     # attempt is one BleakScanner discovery window.
     FIND_ATTEMPTS = 3
     FIND_TIMEOUT = 15.0
+    # Hard ceiling on ONE find attempt.  bleak's find timeout only bounds
+    # the advertisement wait; the scanner's start() -- and its StartDiscovery
+    # D-Bus call -- is OUTSIDE it and unbounded, so a wedged adapter that
+    # never answers StartDiscovery hangs the monitor forever (observed on
+    # prod: one "Scanning..." line, then 2h45m of silence with the scan
+    # claim still held by the hung await).  wait_for-cancelling the find
+    # cancels the hung start, and the catcher releases the scan claim on
+    # a failed/cancelled start.
+    FIND_STALL_CEILING = 45.0
     # After this many failed find attempts, sweep BlueZ for a stale LE
     # link to the device (see disconnect_stale_link) before scanning
     # again: an EasyTouch does not advertise while linked, so a leftover
@@ -855,8 +864,23 @@ class EasyTouchSession:
         logger.info("[%s] Scanning...", self._address)
         device = None
         for attempt in range(self.FIND_ATTEMPTS):
-            device = await BleakScanner.find_device_by_address(
-                self._address, timeout=self.FIND_TIMEOUT)
+            try:
+                device = await asyncio.wait_for(
+                    BleakScanner.find_device_by_address(
+                        self._address, timeout=self.FIND_TIMEOUT),
+                    timeout=self.FIND_STALL_CEILING)
+            except asyncio.TimeoutError:
+                # Not "device absent" -- the SCAN never completed.  Name it
+                # loudly: this is scan infrastructure (a StartDiscovery that
+                # bluetoothd never answered), and retrying into the same
+                # card without saying so is how a monitor dies silently.
+                logger.error(
+                    "[%s] Scan attempt %d/%d STALLED past %.0fs -- "
+                    "StartDiscovery unanswered (wedged adapter).  Check "
+                    "which card holds the scan claim in /run/bt-claims.",
+                    self._address, attempt + 1, self.FIND_ATTEMPTS,
+                    self.FIND_STALL_CEILING)
+                continue
             if device is not None:
                 break
             logger.debug("[%s] Not seen in scan attempt %d/%d",

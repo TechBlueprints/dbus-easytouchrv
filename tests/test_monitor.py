@@ -735,5 +735,40 @@ class SilentUnitTests(unittest.TestCase):
         self.assertIn("Monitor connection lost", "\n".join(caught.output))
 
 
+class ScanStallTests(unittest.TestCase):
+    """A scan that never completes must not hang the monitor forever.
+
+    bleak's find timeout bounds only the advertisement wait; scanner
+    start() and its StartDiscovery D-Bus call are outside it.  On prod a
+    wedged adapter left the monitor showing one "Scanning..." line and
+    then nothing for 2h45m, both thermostats down, scan claims held by
+    the hung awaits.  The ceiling turns that into a logged, retryable
+    failure.
+    """
+
+    def run_async(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_stalled_find_raises_instead_of_hanging(self):
+        async def hang_forever(*a, **k):
+            await asyncio.sleep(3600)
+
+        class HangingScanner:
+            find_device_by_address = staticmethod(hang_forever)
+
+        real_scanner = et.BleakScanner            # the stub is `object`,
+        et.BleakScanner = HangingScanner          # which rejects setattr
+        real_ceiling = et.EasyTouchSession.FIND_STALL_CEILING
+        et.EasyTouchSession.FIND_STALL_CEILING = 0.05
+        et._phantom_connects.clear()
+        try:
+            s = et.EasyTouchSession("AA:BB:CC:DD:EE:FF")
+            with self.assertRaises(et.DeviceNotFound):
+                self.run_async(asyncio.wait_for(s.__aenter__(), timeout=5))
+        finally:
+            et.BleakScanner = real_scanner
+            et.EasyTouchSession.FIND_STALL_CEILING = real_ceiling
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
