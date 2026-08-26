@@ -681,5 +681,59 @@ class PhantomConnectTests(unittest.TestCase):
         self.assertNotIn("AA:BB:CC:DD:EE:FF", et._phantom_connects)
 
 
+class SilentUnitTests(unittest.TestCase):
+    """A unit that never advertises must not be logged as a lost connection.
+
+    The old wording emitted "Monitor connection lost: Device not found
+    after scanning" -- nothing was lost and nothing was found.  An
+    experienced reader took the prefix at face value and diagnosed
+    "connects but cannot hold the link" when the truth was the opposite,
+    which sent the investigation at the BLE stack instead of at the unit.
+    The two cases have disjoint remedies: a dropped link is ours to retry,
+    a silent unit is held by another central, unpowered, or out of range.
+    """
+
+    def setUp(self):
+        reset_fake()
+
+    def run_async(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_not_found_is_its_own_exception_type(self):
+        self.assertTrue(issubclass(et.DeviceNotFound, ConnectionError))
+
+    def test_silent_unit_logged_as_silent_not_lost(self):
+        class SilentSession(FakeSession):
+            async def __aenter__(self):
+                raise et.DeviceNotFound("[AA:BB:CC:DD:EE:FF] not seen in 3 scan windows")
+
+        snapshots = []
+        with self.assertLogs("easytouch_ble", level="INFO") as caught:
+            self.run_async(run_monitor_cycles(
+                snapshots, 2, session_factory=SilentSession,
+                settings=et.MonitorSettings(
+                    persistent=True, poll_seconds=0.001,
+                    diagnostics_seconds=0.0,
+                    reconnect_base=0.001, reconnect_max=0.01)))
+        text = "\n".join(caught.output)
+        self.assertIn("silent", text.lower())
+        self.assertNotIn("Monitor connection lost", text)
+
+    def test_real_drop_still_logged_as_connection_lost(self):
+        class DroppingSession(FakeSession):
+            async def get_status(self, zone):
+                return None
+
+        snapshots = []
+        with self.assertLogs("easytouch_ble", level="INFO") as caught:
+            self.run_async(run_monitor_cycles(
+                snapshots, 4, session_factory=DroppingSession,
+                settings=et.MonitorSettings(
+                    persistent=True, poll_seconds=0.001,
+                    diagnostics_seconds=0.0,
+                    reconnect_base=0.001, reconnect_max=0.01)))
+        self.assertIn("Monitor connection lost", "\n".join(caught.output))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

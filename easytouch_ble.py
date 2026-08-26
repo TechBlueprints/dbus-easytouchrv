@@ -57,6 +57,21 @@ from bleak_connection_manager.validators import (
 logger = logging.getLogger(__name__)
 
 
+class DeviceNotFound(ConnectionError):
+    """No scan window saw the unit advertise.
+
+    Distinct from a lost link because the remedies are disjoint.  An
+    EasyTouch accepts one BLE central and stops advertising while linked,
+    so silence means it is held by another central (the vendor phone app
+    is the common case, and an expected one), unpowered, or out of range
+    -- none of which any amount of reconnecting will fix.  A dropped link,
+    by contrast, is ours to retry.  Keeping them apart in the log matters:
+    the old wording emitted "Monitor connection lost: Device not found
+    after scanning" for this case, which reads as though a connection was
+    lost, and it led an experienced reader straight to the wrong mechanism.
+    """
+
+
 def _brief(exc: BaseException) -> str:
     """One-line rendering of an exception, for expected failures."""
     return "%s: %s" % (type(exc).__name__, exc)
@@ -853,7 +868,9 @@ class EasyTouchSession:
                 # so the next scan window can see it advertise again.
                 await disconnect_stale_link(self._address)
         if device is None:
-            raise ConnectionError(f"[{self._address}] Device not found after scanning")
+            raise DeviceNotFound(
+                f"[{self._address}] not seen in %d scan windows"
+                % self.FIND_ATTEMPTS)
         self.ble_name = device.name or ""
 
         logger.info("[%s] Connecting...", self._address)
@@ -1418,7 +1435,14 @@ async def run_device_monitor(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("[%s] Monitor connection lost: %s", address, exc)
+            if isinstance(exc, DeviceNotFound):
+                # Not a lost connection: the unit never answered a scan.
+                logger.warning(
+                    "[%s] Unit is silent (%s) -- it advertises only when no "
+                    "central holds it, so it is linked elsewhere (phone app), "
+                    "unpowered, or out of range", address, exc)
+            else:
+                logger.warning("[%s] Monitor connection lost: %s", address, exc)
             logger.debug("[%s] Monitor traceback", address, exc_info=True)
             on_snapshot(DeviceSnapshot(applied_changes=unreported))
             unreported = 0
