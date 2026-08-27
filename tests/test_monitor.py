@@ -681,16 +681,13 @@ class PhantomConnectTests(unittest.TestCase):
         self.assertNotIn("AA:BB:CC:DD:EE:FF", et._phantom_connects)
 
 
-class SilentUnitTests(unittest.TestCase):
-    """A unit that never advertises must not be logged as a lost connection.
+class NotFoundWordingTests(unittest.TestCase):
+    """The not-found log line must state the observation, not a cause.
 
-    The old wording emitted "Monitor connection lost: Device not found
-    after scanning" -- nothing was lost and nothing was found.  An
-    experienced reader took the prefix at face value and diagnosed
-    "connects but cannot hold the link" when the truth was the opposite,
-    which sent the investigation at the BLE stack instead of at the unit.
-    The two cases have disjoint remedies: a dropped link is ours to retry,
-    a silent unit is held by another central, unpowered, or out of range.
+    An earlier version logged "Unit is silent ... linked elsewhere,
+    unpowered, or out of range".  The driver cannot know any of that, and
+    during an investigation the line was read back as evidence that the
+    unit was off the air -- circular, and wrong.
     """
 
     def setUp(self):
@@ -699,25 +696,29 @@ class SilentUnitTests(unittest.TestCase):
     def run_async(self, coro):
         return asyncio.get_event_loop().run_until_complete(coro)
 
-    def test_not_found_is_its_own_exception_type(self):
-        self.assertTrue(issubclass(et.DeviceNotFound, ConnectionError))
-
-    def test_silent_unit_logged_as_silent_not_lost(self):
-        class SilentSession(FakeSession):
+    def test_states_observation_not_cause(self):
+        class NeverFound(FakeSession):
             async def __aenter__(self):
                 raise et.DeviceNotFound("[AA:BB:CC:DD:EE:FF] not seen in 3 scan windows")
 
         snapshots = []
-        with self.assertLogs("easytouch_ble", level="INFO") as caught:
+        with self.assertLogs("easytouch_ble", level="WARNING") as caught:
             self.run_async(run_monitor_cycles(
-                snapshots, 2, session_factory=SilentSession,
-                settings=et.MonitorSettings(
-                    persistent=True, poll_seconds=0.001,
-                    diagnostics_seconds=0.0,
-                    reconnect_base=0.001, reconnect_max=0.01)))
-        text = "\n".join(caught.output)
-        self.assertIn("silent", text.lower())
-        self.assertNotIn("Monitor connection lost", text)
+                snapshots, 1, session_factory=NeverFound))
+        line = " ".join(caught.output).lower()
+        self.assertIn("not found by our scan", line)
+        for invented in ("silent", "unpowered", "out of range", "phone app"):
+            self.assertNotIn(invented, line, "log asserts a cause it cannot know")
+
+
+class RealDropWordingTests(unittest.TestCase):
+    """A genuine dropped link must still read as a lost connection."""
+
+    def setUp(self):
+        reset_fake()
+
+    def run_async(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
 
     def test_real_drop_still_logged_as_connection_lost(self):
         class DroppingSession(FakeSession):
@@ -733,41 +734,6 @@ class SilentUnitTests(unittest.TestCase):
                     diagnostics_seconds=0.0,
                     reconnect_base=0.001, reconnect_max=0.01)))
         self.assertIn("Monitor connection lost", "\n".join(caught.output))
-
-
-class ScanStallTests(unittest.TestCase):
-    """A scan that never completes must not hang the monitor forever.
-
-    bleak's find timeout bounds only the advertisement wait; scanner
-    start() and its StartDiscovery D-Bus call are outside it.  On prod a
-    wedged adapter left the monitor showing one "Scanning..." line and
-    then nothing for 2h45m, both thermostats down, scan claims held by
-    the hung awaits.  The ceiling turns that into a logged, retryable
-    failure.
-    """
-
-    def run_async(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
-
-    def test_stalled_find_raises_instead_of_hanging(self):
-        async def hang_forever(*a, **k):
-            await asyncio.sleep(3600)
-
-        class HangingScanner:
-            find_device_by_address = staticmethod(hang_forever)
-
-        real_scanner = et.BleakScanner            # the stub is `object`,
-        et.BleakScanner = HangingScanner          # which rejects setattr
-        real_ceiling = et.EasyTouchSession.FIND_STALL_CEILING
-        et.EasyTouchSession.FIND_STALL_CEILING = 0.05
-        et._phantom_connects.clear()
-        try:
-            s = et.EasyTouchSession("AA:BB:CC:DD:EE:FF")
-            with self.assertRaises(et.DeviceNotFound):
-                self.run_async(asyncio.wait_for(s.__aenter__(), timeout=5))
-        finally:
-            et.BleakScanner = real_scanner
-            et.EasyTouchSession.FIND_STALL_CEILING = real_ceiling
 
 
 if __name__ == "__main__":

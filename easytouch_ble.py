@@ -58,17 +58,16 @@ logger = logging.getLogger(__name__)
 
 
 class DeviceNotFound(ConnectionError):
-    """No scan window saw the unit advertise.
+    """Our scan windows did not see the unit.
 
-    Distinct from a lost link because the remedies are disjoint.  An
-    EasyTouch accepts one BLE central and stops advertising while linked,
-    so silence means it is held by another central (the vendor phone app
-    is the common case, and an expected one), unpowered, or out of range
-    -- none of which any amount of reconnecting will fix.  A dropped link,
-    by contrast, is ours to retry.  Keeping them apart in the log matters:
-    the old wording emitted "Monitor connection lost: Device not found
-    after scanning" for this case, which reads as though a connection was
-    lost, and it led an experienced reader straight to the wrong mechanism.
+    Kept distinct from a lost link because the two say different things:
+    a dropped link is ours to retry, while a device our scan never saw
+    may be anywhere from genuinely off the air to perfectly healthy on a
+    radio that cannot hear it.  This exception deliberately does NOT
+    encode a cause -- an earlier version's log line asserted the unit was
+    "silent", which the driver cannot know, and that wording was later
+    read back as evidence during an investigation.  Report the
+    observation; leave the cause to whoever can measure it.
     """
 
 
@@ -817,15 +816,6 @@ class EasyTouchSession:
     # attempt is one BleakScanner discovery window.
     FIND_ATTEMPTS = 3
     FIND_TIMEOUT = 15.0
-    # Hard ceiling on ONE find attempt.  bleak's find timeout only bounds
-    # the advertisement wait; the scanner's start() -- and its StartDiscovery
-    # D-Bus call -- is OUTSIDE it and unbounded, so a wedged adapter that
-    # never answers StartDiscovery hangs the monitor forever (observed on
-    # prod: one "Scanning..." line, then 2h45m of silence with the scan
-    # claim still held by the hung await).  wait_for-cancelling the find
-    # cancels the hung start, and the catcher releases the scan claim on
-    # a failed/cancelled start.
-    FIND_STALL_CEILING = 45.0
     # After this many failed find attempts, sweep BlueZ for a stale LE
     # link to the device (see disconnect_stale_link) before scanning
     # again: an EasyTouch does not advertise while linked, so a leftover
@@ -864,23 +854,12 @@ class EasyTouchSession:
         logger.info("[%s] Scanning...", self._address)
         device = None
         for attempt in range(self.FIND_ATTEMPTS):
-            try:
-                device = await asyncio.wait_for(
-                    BleakScanner.find_device_by_address(
-                        self._address, timeout=self.FIND_TIMEOUT),
-                    timeout=self.FIND_STALL_CEILING)
-            except asyncio.TimeoutError:
-                # Not "device absent" -- the SCAN never completed.  Name it
-                # loudly: this is scan infrastructure (a StartDiscovery that
-                # bluetoothd never answered), and retrying into the same
-                # card without saying so is how a monitor dies silently.
-                logger.error(
-                    "[%s] Scan attempt %d/%d STALLED past %.0fs -- "
-                    "StartDiscovery unanswered (wedged adapter).  Check "
-                    "which card holds the scan claim in /run/bt-claims.",
-                    self._address, attempt + 1, self.FIND_ATTEMPTS,
-                    self.FIND_STALL_CEILING)
-                continue
+            # No local timeout wrapper here: BCM bounds StartDiscovery and
+            # StopDiscovery itself (0308c5b), which is where the unbounded
+            # await actually lived.  A second ceiling out here could only
+            # ever fire after BCM's, so it would be dead code.
+            device = await BleakScanner.find_device_by_address(
+                self._address, timeout=self.FIND_TIMEOUT)
             if device is not None:
                 break
             logger.debug("[%s] Not seen in scan attempt %d/%d",
@@ -1461,10 +1440,12 @@ async def run_device_monitor(
         except Exception as exc:
             if isinstance(exc, DeviceNotFound):
                 # Not a lost connection: the unit never answered a scan.
-                logger.warning(
-                    "[%s] Unit is silent (%s) -- it advertises only when no "
-                    "central holds it, so it is linked elsewhere (phone app), "
-                    "unpowered, or out of range", address, exc)
+                # State the observation, not a conclusion about the unit.
+                # The earlier wording ("Unit is silent... linked elsewhere,
+                # unpowered, or out of range") asserted things the driver
+                # cannot know, and was then read back as evidence.
+                logger.warning("[%s] Not found by our scan (%s)",
+                               address, exc)
             else:
                 logger.warning("[%s] Monitor connection lost: %s", address, exc)
             logger.debug("[%s] Monitor traceback", address, exc_info=True)
