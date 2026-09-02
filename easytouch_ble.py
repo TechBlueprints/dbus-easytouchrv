@@ -106,6 +106,63 @@ def note_link_alive(address: str) -> None:
     _phantom_connects.pop(_key(address), None)
 
 
+# Per-address failure reporting.  A unit that is physically dark fails
+# every attempt forever, and narrating each one produced 603 "Reconnecting"
+# lines plus a scan/phantom/not-found line apiece in one retained log.  The
+# backoff itself is correct; only the narration is excess.  So: report the
+# TRANSITIONS (went unreachable, reason changed, came back) at INFO/WARNING,
+# repeat at most hourly, and put the per-attempt detail at DEBUG.
+_failure_state: dict = {}
+FAILURE_REPEAT_INTERVAL = 3600.0
+
+
+def note_unreachable(address: str, reason: object, attempt: int,
+                     delay: float) -> None:
+    """Log a failed connect cycle at a level that reflects its news value."""
+    key = _key(address)
+    now = time.monotonic()
+    sig = str(reason)[:120]
+    st = _failure_state.get(key)
+    if st is None:
+        _failure_state[key] = {"since": now, "sig": sig, "last_info": now,
+                               "count": 1}
+        logger.warning("[%s] Unreachable: %s -- retrying, next in %.0fs",
+                       address, reason, delay)
+        return
+    st["count"] += 1
+    if sig != st["sig"]:
+        # A changed reason is genuinely new information (e.g. the daemon
+        # coming back turns ServiceUnknown into a real scan result).
+        st["sig"] = sig
+        st["last_info"] = now
+        logger.warning("[%s] Unreachable, reason changed: %s "
+                       "(attempt %d, next in %.0fs)",
+                       address, reason, attempt, delay)
+        return
+    if now - st["last_info"] >= FAILURE_REPEAT_INTERVAL:
+        st["last_info"] = now
+        logger.info("[%s] Still unreachable after %.0f min, %d attempts; "
+                    "next in %.0fs", address,
+                    (now - st["since"]) / 60.0, st["count"], delay)
+        return
+    logger.debug("[%s] Unreachable (attempt %d, next in %.0fs): %s",
+                 address, attempt, delay, reason)
+
+
+def note_reachable(address: str) -> None:
+    """Report recovery, but only for a unit we had reported unreachable."""
+    st = _failure_state.pop(_key(address), None)
+    if st is not None:
+        logger.info("[%s] Reachable again after %.0f min and %d attempts",
+                    address, (time.monotonic() - st["since"]) / 60.0,
+                    st["count"])
+
+
+def is_unreachable(address: str) -> bool:
+    """True while this address is in a reported-unreachable episode."""
+    return _key(address) in _failure_state
+
+
 def _is_link_gone(exc: BaseException) -> bool:
     """True when ``exc`` means the link (or its bus) is definitively dead."""
     if isinstance(exc, (OSError, KeyError)):
@@ -847,11 +904,17 @@ class EasyTouchSession:
             # hours.  Clear the object BEFORE scanning; the sweep already
             # matches on Connected=true, it simply never used to run in
             # this case because the device IS findable.
-            logger.warning("[%s] Previous connect was a phantom (no link "
-                           "behind it); clearing BlueZ state first",
-                           self._address)
+            # DEBUG: when the sweep actually finds and clears something it
+            # logs that itself at WARNING, so this preamble is redundant.
+            logger.debug("[%s] Previous connect was a phantom; clearing "
+                         "BlueZ state first", self._address)
             await disconnect_stale_link(self._address)
-        logger.info("[%s] Scanning...", self._address)
+        # Once a unit is known unreachable, per-attempt scan lines are
+        # noise; the hourly summary carries the state instead.
+        if is_unreachable(self._address):
+            logger.debug("[%s] Scanning...", self._address)
+        else:
+            logger.info("[%s] Scanning...", self._address)
         device = None
         for attempt in range(self.FIND_ATTEMPTS):
             # No local timeout wrapper here: BCM bounds StartDiscovery and
@@ -1356,6 +1419,7 @@ async def run_device_monitor(
     while True:
         try:
             async with session_factory(address, passcode) as s:
+                note_reachable(address)
                 # NB: the backoff is NOT reset here.  A unit that accepts the
                 # connection and drops it milliseconds later (seen in the
                 # field: connect, then "Not connected" on the very next GATT
@@ -1454,8 +1518,12 @@ async def run_device_monitor(
             delay = min(settings.reconnect_base * (2 ** backoff_attempt),
                         settings.reconnect_max)
             backoff_attempt += 1
-            logger.info("[%s] Reconnecting in %.0fs (attempt %d)",
-                        address, delay, backoff_attempt)
+            note_unreachable(
+                address,
+                ("not found by our scan (%s)" % exc)
+                if isinstance(exc, DeviceNotFound)
+                else ("connection lost: %s" % exc),
+                backoff_attempt, delay)
             # Wake early if a change arrives so user commands are snappy.
             try:
                 item = await asyncio.wait_for(change_queue.get(), timeout=delay)

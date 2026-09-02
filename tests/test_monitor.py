@@ -522,24 +522,41 @@ class BackoffTests(unittest.TestCase):
         return asyncio.get_event_loop().run_until_complete(coro)
 
     def test_backoff_grows_when_connect_succeeds_but_polls_fail(self):
+        """Assert the delay itself, not the log wording.
+
+        The old version parsed "Reconnecting in Ns (attempt N)" out of the
+        log; that line is now a per-address failure report whose level
+        varies, so the test spies on the reporter and checks the delays it
+        is handed.  Behaviour, not text.
+        """
         class InstantDropSession(FakeSession):
             async def get_status(self, zone):
                 return None
 
-        snapshots = []
-        with self.assertLogs("easytouch_ble", level="INFO") as caught:
+        seen = []
+        real = et.note_unreachable
+
+        def spy(address, reason, attempt, delay):
+            seen.append((attempt, delay))
+            return real(address, reason, attempt, delay)
+
+        et.note_unreachable = spy
+        try:
+            snapshots = []
             self.run_async(run_monitor_cycles(
                 snapshots, 7, session_factory=InstantDropSession,
                 settings=et.MonitorSettings(
                     persistent=True, poll_seconds=0.001,
                     diagnostics_seconds=0.0,
                     reconnect_base=0.001, reconnect_max=0.05)))
+        finally:
+            et.note_unreachable = real
 
-        attempts = [int(m.rsplit("attempt ", 1)[1].rstrip(")"))
-                    for m in caught.output if "Reconnecting in" in m]
-        self.assertGreaterEqual(len(attempts), 2, caught.output)
-        self.assertEqual(attempts[:2], [1, 2],
-                         "backoff reset on connect: %r" % attempts)
+        self.assertGreaterEqual(len(seen), 2, seen)
+        self.assertEqual([a for a, _ in seen[:2]], [1, 2],
+                         "backoff reset on connect: %r" % seen)
+        self.assertGreater(seen[1][1], seen[0][1],
+                           "delay did not grow: %r" % seen)
 
 
 class OrphanedBusTests(unittest.TestCase):
@@ -734,6 +751,58 @@ class RealDropWordingTests(unittest.TestCase):
                     diagnostics_seconds=0.0,
                     reconnect_base=0.001, reconnect_max=0.01)))
         self.assertIn("Monitor connection lost", "\n".join(caught.output))
+
+
+class FailureReportingTests(unittest.TestCase):
+    """Report transitions, not repetitions.
+
+    A physically dark unit fails every attempt forever.  Narrating each one
+    produced 603 "Reconnecting" lines plus scan/phantom/not-found lines
+    apiece in a single retained log.  The backoff is correct; the narration
+    was the excess.
+    """
+
+    def setUp(self):
+        et._failure_state.clear()
+
+    def tearDown(self):
+        et._failure_state.clear()
+
+    def test_first_failure_reported_then_repeats_go_quiet(self):
+        with self.assertLogs("easytouch_ble", level="DEBUG") as caught:
+            for attempt in range(1, 6):
+                et.note_unreachable("AA:BB:CC:DD:EE:FF",
+                                    "not found by our scan", attempt, 900.0)
+        loud = [m for m in caught.output if not m.startswith("DEBUG")]
+        self.assertEqual(len(loud), 1, "expected one loud line, got %r" % loud)
+        self.assertIn("Unreachable", loud[0])
+
+    def test_changed_reason_is_reported(self):
+        et.note_unreachable("AA:BB:CC:DD:EE:FF", "reason one", 1, 30.0)
+        with self.assertLogs("easytouch_ble", level="DEBUG") as caught:
+            et.note_unreachable("AA:BB:CC:DD:EE:FF", "reason two", 2, 60.0)
+        loud = [m for m in caught.output if not m.startswith("DEBUG")]
+        self.assertEqual(len(loud), 1)
+        self.assertIn("reason changed", loud[0])
+
+    def test_hourly_summary_when_nothing_changes(self):
+        et.note_unreachable("AA:BB:CC:DD:EE:FF", "same reason", 1, 900.0)
+        st = et._failure_state["AA:BB:CC:DD:EE:FF"]
+        st["last_info"] -= et.FAILURE_REPEAT_INTERVAL + 1
+        st["since"] -= et.FAILURE_REPEAT_INTERVAL + 1
+        with self.assertLogs("easytouch_ble", level="INFO") as caught:
+            et.note_unreachable("AA:BB:CC:DD:EE:FF", "same reason", 9, 900.0)
+        self.assertIn("Still unreachable", " ".join(caught.output))
+
+    def test_recovery_reported_once_and_only_after_a_failure(self):
+        et.note_unreachable("AA:BB:CC:DD:EE:FF", "gone", 1, 30.0)
+        with self.assertLogs("easytouch_ble", level="INFO") as caught:
+            et.note_reachable("AA:BB:CC:DD:EE:FF")
+        self.assertIn("Reachable again", " ".join(caught.output))
+        # a second call, with no failure episode open, must say nothing
+        with self.assertRaises(AssertionError):
+            with self.assertLogs("easytouch_ble", level="INFO"):
+                et.note_reachable("AA:BB:CC:DD:EE:FF")
 
 
 if __name__ == "__main__":
