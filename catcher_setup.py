@@ -35,8 +35,11 @@ already provides and only falls back to ext/.
 from __future__ import annotations
 
 import configparser
+import logging
 import os
 import sys
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_ble_stack() -> None:
@@ -110,10 +113,38 @@ def _tune_conn_params() -> bool:
         "1", "true", "yes", "on")
 
 
-def install_catcher_from_config(owner: str) -> None:
-    """Install the bleak catcher with the configured adapter routing."""
+def install_catcher_from_config(owner: str) -> bool:
+    """Install the bleak catcher with the configured adapter routing.
+
+    Returns whether the catcher was installed.  BCM is optional: a checkout
+    cloned without --recursive, or a box with only bleak and
+    bleak-retry-connector, still runs.  What is lost is stated plainly at
+    startup rather than failing the service, because the driver's own
+    retry/backoff and post-connect validation (easytouch_ble) do not depend
+    on it -- only the multi-adapter routing does.
+    """
     _ensure_ble_stack()
-    from bleak_connection_manager import install_bleak_catcher
+    try:
+        from bleak_connection_manager import install_bleak_catcher
+    except ImportError as exc:
+        adapters, link_caps = catcher_options()
+        logger.warning(
+            "bleak-connection-manager not available (%s); running on plain "
+            "bleak-retry-connector. Lost: claim-aware adapter selection, "
+            "cross-process link coordination, per-adapter link caps, and "
+            "connection-parameter tuning. BlueZ picks the adapter.", exc)
+        # Silence is the wrong answer when the operator configured routing
+        # that is now being ignored: an "MAC@hciX" pin reads as honoured.
+        if adapters:
+            logger.warning(
+                "adapters = %s is NOT being applied without "
+                "bleak-connection-manager", " ".join(adapters))
+        if link_caps:
+            logger.warning(
+                "link_caps = %s is NOT being applied without "
+                "bleak-connection-manager",
+                " ".join("%s:%d" % kv for kv in sorted(link_caps.items())))
+        return False
 
     adapters, link_caps = catcher_options()
     install_bleak_catcher(
@@ -123,3 +154,4 @@ def install_catcher_from_config(owner: str) -> None:
         wrap_scanner=True,
         tune_conn_params=_tune_conn_params(),
     )
+    return True

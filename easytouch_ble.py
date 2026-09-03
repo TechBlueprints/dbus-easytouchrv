@@ -31,12 +31,18 @@ is no binary framing, checksum, or manual chunking; the ATT layer performs
 long reads/writes for payloads larger than the negotiated MTU.
 
 Connection model: transient sessions (connect, exchange, disconnect).
-Adapter selection, cross-process claims coordination, and connection-parameter
-tuning come from bleak-connection-manager v2's process-wide bleak catcher:
-the entry point must call ``install_bleak_catcher(...)`` BEFORE importing
-this module, because the ``BleakClient`` / ``BleakScanner`` bindings below
-are captured at import time.  Retry semantics come from
-bleak-retry-connector's ``establish_connection``.
+Retry semantics come from bleak-retry-connector's ``establish_connection``,
+which together with bleak is the only hard requirement.
+
+bleak-connection-manager is OPTIONAL.  When present it supplies adapter
+selection, cross-process claims coordination, and connection-parameter
+tuning via its process-wide bleak catcher, and the entry point must call
+``install_bleak_catcher(...)`` BEFORE importing this module, because the
+``BleakClient`` / ``BleakScanner`` bindings below are captured at import
+time.  When absent the driver runs on plain bleak-retry-connector: BlueZ
+picks the adapter, configured `adapters`/`link_caps` routing does not
+apply (said so at startup, see catcher_setup), and post-connect validation
+falls back to a local characteristic check without the late-GATT retry.
 """
 
 from __future__ import annotations
@@ -49,10 +55,47 @@ from dataclasses import dataclass, field
 
 from bleak import BleakClient, BleakScanner
 from bleak_retry_connector import establish_connection
-from bleak_connection_manager.validators import (
-    tolerate_late_gatt,
-    validate_char_exists,
-)
+
+try:
+    from bleak_connection_manager.validators import (
+        tolerate_late_gatt,
+        validate_char_exists,
+    )
+    HAVE_BCM_VALIDATORS = True
+except ImportError:      # plain bleak + bleak-retry-connector, no BCM
+    HAVE_BCM_VALIDATORS = False
+
+    def validate_char_exists(uuid):
+        """Minimal stand-in for BCM's validator: is the vendor characteristic
+        present in the resolved GATT table?
+
+        Catches the connect that lands with an empty or partial service
+        table -- the phantom link this driver has to reject.  BCM's version
+        additionally logs the discovered services on failure.
+        """
+        target = uuid.lower()
+
+        async def _validator(client):
+            for service in getattr(client, "services", None) or ():
+                for char in service.characteristics:
+                    if char.uuid.lower() == target:
+                        return True
+            return False
+
+        return _validator
+
+    def tolerate_late_gatt(validator, waits=None):
+        """No-op without BCM.
+
+        The real one re-reads the service table from BlueZ between waits
+        (validators.refresh_services), reaching into bleak's backend to
+        bypass its service cache.  Retrying without that re-read just
+        re-inspects the same cached table, so it would burn 14s to reach
+        the same answer.  A chip that registers vendor services late fails
+        validation here and is retried by the monitor's own backoff -- a
+        slower recovery, not a broken one.
+        """
+        return validator
 
 logger = logging.getLogger(__name__)
 
@@ -959,6 +1002,18 @@ class EasyTouchSession:
         # before propagating, because __aexit__ is not called when
         # __aenter__ raises.
         try:
+            # validate_connection above is a CATCHER kwarg: bleak-retry-connector
+            # does not know it, and bleak's BleakClient swallows unknown kwargs
+            # into **kwargs without complaint.  So without BCM the validator is
+            # accepted and never run -- a phantom link would pass silently.  Run
+            # it here, where it holds either way: after the catcher has already
+            # blessed the link this is an in-memory rescan of a handful of
+            # services that passes immediately, and without the catcher it is
+            # the only thing standing between us and a serviceless connection.
+            if not await self._validate_link():
+                raise ConnectionError(
+                    "[%s] connected but GATT lacks the vendor characteristic"
+                    % self._address)
             logger.info("[%s] Connected (MTU: %d)", self._address, self._client.mtu_size)
             if self._passcode:
                 await self._authenticate()
@@ -967,6 +1022,23 @@ class EasyTouchSession:
             raise
 
         return self
+
+    async def _validate_link(self) -> bool:
+        """Whether the live link exposes the vendor return characteristic.
+
+        With BCM this repeats a check the catcher already made (cheap, and
+        it keeps one code path); without BCM it is the whole of our
+        post-connect validation, since the catcher is what would otherwise
+        have run validate_connection.  A raise counts as failure, matching
+        how the catcher treats its validators.
+        """
+        try:
+            return bool(await tolerate_late_gatt(
+                validate_char_exists(RETURN_UUID))(self._client))
+        except Exception:
+            logger.debug("[%s] link validation raised", self._address,
+                         exc_info=True)
+            return False
 
     def _close_orphaned_bus(self) -> bool:
         """Close bleak's per-session D-Bus connection if disconnect left it open.
