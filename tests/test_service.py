@@ -207,10 +207,13 @@ class ThermostatDeviceTests(unittest.TestCase):
             sw["/SwitchableOutput/cool/Settings/DimmingMax"] * 9 / 5 + 32, 85.0)
         self.assertAlmostEqual(
             sw["/SwitchableOutput/heat/Settings/DimmingMin"] * 9 / 5 + 32, 45.0)
-        # one step == exactly one degree F, displayed without decimals
+        # StepSize must NOT be published: GUI v2 converts it with the same
+        # absolute-temperature formula as the values (x*9/5 + 32), so any
+        # step we publish arrives >= 32 F -- wider than a 40-72 F range,
+        # collapsing the slider to its two endpoints.  Absent, the GUI falls
+        # back to 1 display unit, i.e. 1 F.  Decimals stays (display only).
         for out in ("cool", "heat"):
-            step = sw["/SwitchableOutput/%s/Settings/StepSize" % out]
-            self.assertAlmostEqual(step * 9 / 5, 1.0)
+            self.assertNotIn("/SwitchableOutput/%s/Settings/StepSize" % out, sw)
             self.assertEqual(sw["/SwitchableOutput/%s/Settings/Decimals" % out], 0)
         self.assertEqual(sw["/SwitchableOutput/mode/Settings/Type"], 6)
         self.assertEqual(sw["/SwitchableOutput/cool/Settings/Type"], 3)

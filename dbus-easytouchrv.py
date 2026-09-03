@@ -249,10 +249,6 @@ def f_to_c_exact(f: float | None) -> float | None:
     return (f - 32.0) * 5.0 / 9.0
 
 
-# One degree Fahrenheit expressed in Celsius: the slider's step size.
-STEP_ONE_DEGREE_F = 5.0 / 9.0
-
-
 def c_to_f(c: float | None) -> int | None:
     """Convert Celsius back to the device's integer Fahrenheit."""
     if c is None:
@@ -557,8 +553,21 @@ class ThermostatDevice:
                              f_to_c_exact(cfg.min_cool))
                 ctx.add_path(self._out("cool", "Settings/DimmingMax"),
                              f_to_c_exact(cfg.max_cool))
-                ctx.add_path(self._out("cool", "Settings/StepSize"),
-                             STEP_ONE_DEGREE_F)
+                # Settings/StepSize is deliberately NOT published.  GUI v2
+                # runs it through the same conversion as the VALUES
+                # (SwitchableOutputSlider.qml gives stepSizeItem the same
+                # sourceUnit/displayUnit as DimmingMin/Max), and the C->F
+                # conversion is UnitLinear(9/5, +32).  A step is a DELTA, so
+                # the +32 offset must not apply: our 5/9 C ("one degree F")
+                # arrives as 0.5556*9/5+32 = 33 F, larger than the whole
+                # 40-72 F range, leaving only the two endpoints reachable
+                # and drawing a single dot (dotCount = (to-from)/step + 1).
+                # Any positive value we could publish lands >= 32 F, so the
+                # field cannot express a usable step under that conversion.
+                # Omitting it makes the slider fall back to `stepSize: 1`,
+                # which is one DISPLAY unit -- exactly 1 F for a Fahrenheit
+                # user (1 C for a Celsius one; the write path rounds to
+                # whole F either way, which is all the unit accepts).
                 ctx.add_path(self._out("cool", "Settings/Decimals"), 0)
                 # Declares the wire unit as Celsius so the device-list page
                 # converts to the user's unit; the switch card's slider
@@ -576,8 +585,7 @@ class ThermostatDevice:
                              f_to_c_exact(cfg.min_heat))
                 ctx.add_path(self._out("heat", "Settings/DimmingMax"),
                              f_to_c_exact(cfg.max_heat))
-                ctx.add_path(self._out("heat", "Settings/StepSize"),
-                             STEP_ONE_DEGREE_F)
+                # See the StepSize note on the cool slider above.
                 ctx.add_path(self._out("heat", "Settings/Decimals"), 0)
                 # Declares the wire unit as Celsius so the device-list page
                 # converts to the user's unit; the switch card's slider
