@@ -964,8 +964,27 @@ class EasyTouchSession:
             # StopDiscovery itself (0308c5b), which is where the unbounded
             # await actually lived.  A second ceiling out here could only
             # ever fire after BCM's, so it would be dead code.
+            # Pattern is a BlueZ discovery filter, not a bleak-side one, and
+            # that distinction is the whole point: bluetoothd only CREATES
+            # Device1 objects for addresses matching the prefix, so the
+            # advertisements from everything else in the room are dropped
+            # before they cross the bus.  Unfiltered, bluetoothd forwards
+            # every advertisement it hears to this client -- hundreds a
+            # second in a busy room, decoded in Python, with bluetoothd and
+            # dbus-daemon paying on the way.  That cost is invisible on a
+            # deaf card and severe on a healthy one: on 2026-09-05 this
+            # process ran 26% CPU and bluetoothd 18% during scan windows on
+            # a receiving card, and the Cerbo's stock watchdog rebooted the
+            # box on load.  We look for exactly one known MAC per scan, so
+            # there is nothing to lose by saying so.
+            #
+            # Caveat: BlueZ unions discovery filters across clients on an
+            # adapter, so this only bounds object creation while we are the
+            # only discovery client on that card.  A co-tenant scanning
+            # unfiltered restores the firehose for everyone.
             device = await BleakScanner.find_device_by_address(
-                self._address, timeout=self.FIND_TIMEOUT)
+                self._address, timeout=self.FIND_TIMEOUT,
+                bluez={"filters": {"Pattern": self._address}})
             if device is not None:
                 break
             logger.debug("[%s] Not seen in scan attempt %d/%d",

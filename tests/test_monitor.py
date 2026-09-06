@@ -375,12 +375,14 @@ class StaleLinkSweepTests(unittest.TestCase):
         """Stub the scanner (scripted find results), the connector and the
         sweep hook.  sweep_log records how many finds had run at sweep time."""
         finds = []
+        scan_kwargs = []
 
         class StubScanner:
             @staticmethod
-            async def find_device_by_address(address, timeout=0):
+            async def find_device_by_address(address, timeout=0, **kwargs):
                 result = find_results[len(finds)]
                 finds.append(address)
+                scan_kwargs.append(kwargs)
                 if result:
                     return types.SimpleNamespace(
                         name="EasyTouch 347000123", address=address)
@@ -394,6 +396,8 @@ class StaleLinkSweepTests(unittest.TestCase):
 
         async def fake_establish(*a, **k):
             return StubClient()
+
+        self.scan_kwargs = scan_kwargs
 
         async def fake_sweep(address):
             sweep_log.append(len(finds))
@@ -429,6 +433,33 @@ class StaleLinkSweepTests(unittest.TestCase):
         self.run_async(go())
         self.assertEqual(sweeps, [])
         self.assertEqual(len(finds), 1)
+
+    def test_scan_passes_bluez_pattern_filter_for_this_address(self):
+        """Every scan window must carry the BlueZ Pattern filter.
+
+        Without it bluetoothd creates a Device1 object for every advertiser
+        in range and forwards the lot over D-Bus to this client. On a
+        healthy card in a busy room that cost 26% CPU here and 18% in
+        bluetoothd, and the Cerbo's watchdog rebooted the box on load
+        (2026-09-05). The filter is what keeps a scan proportional to the
+        one device it is looking for, so it is asserted, not assumed.
+        """
+        sweeps = []
+        self._install([False, False, False], sweeps)
+
+        async def go():
+            s = et.EasyTouchSession("AA:BB:CC:DD:EE:FF")
+            try:
+                await s.__aenter__()
+            except et.DeviceNotFound:
+                pass
+        self.run_async(go())
+
+        self.assertEqual(len(self.scan_kwargs), 3)
+        for kwargs in self.scan_kwargs:
+            self.assertEqual(
+                kwargs.get("bluez"),
+                {"filters": {"Pattern": "AA:BB:CC:DD:EE:FF"}})
 
     def test_sweep_once_even_when_never_found(self):
         sweeps = []
