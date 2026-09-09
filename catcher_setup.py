@@ -23,13 +23,18 @@ CLI tools (provision.py, easytouch_device.py) routing identically: an
 `adapters = hci1` allowlist written for the service also steers a hand-run
 scan off a dead onboard adapter.
 
-BLE stack resolution: on a fleet install the service/run script execs the
-shared BCM checkout's interpreter shim (/data/bcm/python3), which serves
-bleak, bleak-retry-connector, bleak-connection-manager, dbus-fast and
-friends for every consumer on the box.  A standalone checkout (bare clone,
-plain python3) gets the same stack from this repo's vendored ext/
-submodules instead.  _ensure_ble_stack() prefers whatever the interpreter
-already provides and only falls back to ext/.
+BLE stack resolution: bleak-connection-manager is NEVER vendored here.  It
+is installed once per box at /data/bcm (install.sh step 2b) and shared by
+every consumer; the service/run script execs its interpreter shim
+(/data/bcm/python3), which serves bleak, bleak-retry-connector,
+bleak-connection-manager, dbus-fast and friends.  This repo vendors only
+the rest of the stack, as a fallback for a box that has no /data/bcm.
+
+Consequence on Venus specifically: /data/bcm is also where dbus-fast 5
+comes from, and Venus ships 2.21.1 while bleak needs >= 4.  So on Venus
+the fallback cannot satisfy bleak either, and install.sh is required
+rather than merely recommended.  _ensure_ble_stack() says so plainly
+instead of letting it surface as an ImportError deep inside bleak.
 """
 
 from __future__ import annotations
@@ -42,9 +47,37 @@ import sys
 logger = logging.getLogger(__name__)
 
 
+def _warn_if_dbus_fast_too_old() -> None:
+    """Say plainly when the fallback cannot actually satisfy bleak.
+
+    bleak needs dbus-fast >= 4; Venus ships 2.21.1, whose package has no
+    ``annotations`` module.  /data/bcm is what supplies a new enough copy,
+    so without it the very next import of bleak dies somewhere inside
+    dbus_fast with nothing pointing at the cause.  One line here costs
+    nothing and turns that into an actionable message.
+    """
+    try:
+        import importlib.util
+        if importlib.util.find_spec("dbus_fast") is None:
+            return                      # not Linux/BlueZ, or no dbus stack
+        if importlib.util.find_spec("dbus_fast.annotations") is not None:
+            return                      # new enough
+    except (ImportError, ValueError):
+        return
+    logger.error(
+        "dbus-fast is too old for bleak (no dbus_fast.annotations; bleak "
+        "needs >= 4, Venus ships 2.21.1). The shared install at /data/bcm "
+        "supplies a current one -- run install.sh. Importing bleak will "
+        "fail until then.")
+
+
 def _ensure_ble_stack() -> None:
     """Put the vendored ext/ BLE stack on sys.path unless already provided
-    (by the shared /data/bcm shim, or by test stubs)."""
+    (by the shared /data/bcm shim, or by test stubs).
+
+    bleak-connection-manager is deliberately NOT among the vendored
+    entries: it lives at /data/bcm and nowhere else (see module docstring).
+    """
     if "bleak_connection_manager" in sys.modules:
         return
     try:
@@ -55,8 +88,6 @@ def _ensure_ble_stack() -> None:
         pass
     _ext = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
     for _sub in [
-        os.path.join(_ext, "bleak-connection-manager", "src"),
-        os.path.join(_ext, "bleak-connection-manager", "ext"),
         os.path.join(_ext, "bleak-retry-connector", "src"),
         os.path.join(_ext, "bluetooth-adapters", "src"),
         os.path.join(_ext, "aiooui", "src"),
@@ -64,6 +95,7 @@ def _ensure_ble_stack() -> None:
     ]:
         if os.path.isdir(_sub) and _sub not in sys.path:
             sys.path.insert(0, _sub)
+    _warn_if_dbus_fast_too_old()
 
 
 def catcher_options() -> tuple[list[str], dict[str, int]]:
