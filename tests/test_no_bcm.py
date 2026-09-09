@@ -123,24 +123,183 @@ class FallbackValidatorTests(unittest.TestCase):
         self.assertFalse(self._check(FakeClient(None)))
 
 
-class CatcherFallbackTests(unittest.TestCase):
-    def test_install_returns_false_and_warns_about_ignored_routing(self):
-        # The import must fail at CALL time, not just at module load: a
-        # sibling test module leaves a stubbed bleak_connection_manager in
-        # sys.modules, which would otherwise satisfy the import and make
-        # this pass alone but not in the suite.
+class ContractStartupLineTests(unittest.TestCase):
+    """The CONSUMERS.md startup lines are a fleet interface, not prose.
+
+    A monitor greps these across services, so the anchor and wording are
+    pinned verbatim here; paraphrasing one silently drops this service out
+    of fleet monitoring.
+    """
+
+    ANCHOR = "BLE coordination: "
+
+    def _catcher_setup(self):
         cs = _load_without_bcm("catcher_setup", "_cs_no_bcm")
+        cs.catcher_options = lambda: (["AA:BB:CC:DD:EE:FF@hci1", "hci2"],
+                                      {"hci1": 5})
+        return cs
+
+    def test_no_shared_install_warns_and_names_ignored_routing(self):
+        cs = self._catcher_setup()
+        cs.shared_dir = lambda: "/nonexistent/bcm"
         with _NoBCM():
-            cs.catcher_options = lambda: (["AA:BB:CC:DD:EE:FF@hci1"],
-                                          {"hci1": 5})
             with self.assertLogs(cs.logger, level=logging.WARNING) as cm:
                 self.assertFalse(cs.install_catcher_from_config("test"))
         blob = "\n".join(cm.output)
-        # The operator must be told their routing is being ignored, not
-        # left to infer it from a link landing on the wrong radio.
-        self.assertIn("bleak-connection-manager not available", blob)
+        self.assertIn(
+            "BLE coordination: no shared install at /nonexistent/bcm; "
+            "running uncoordinated, no claims, no adapter routing, "
+            "no card recovery", blob)
+        # Silence about ignored routing is the dangerous outcome: a pin
+        # reads as honoured while BlueZ picks the card.
         self.assertIn("AA:BB:CC:DD:EE:FF@hci1", blob)
         self.assertIn("hci1:5", blob)
+
+    def test_empty_dir_collapses_into_the_no_install_line(self):
+        # One key, so "never look" is reported as absence rather than as
+        # the separate DIR-empty line the contract reserves for two keys.
+        cs = self._catcher_setup()
+        cs.shared_dir = lambda: ""
+        with _NoBCM():
+            with self.assertLogs(cs.logger, level=logging.WARNING) as cm:
+                self.assertFalse(cs.install_catcher_from_config("test"))
+        self.assertIn("BLE coordination: no shared install at ",
+                      "\n".join(cm.output))
+
+    def test_every_coordination_line_carries_the_anchor(self):
+        cs = self._catcher_setup()
+        cs.shared_dir = lambda: "/nonexistent/bcm"
+        with _NoBCM():
+            with self.assertLogs(cs.logger, level=logging.WARNING) as cm:
+                cs.install_catcher_from_config("test")
+        coordination = [r for r in cm.output if "coordination" in r]
+        self.assertTrue(coordination)
+        for record in coordination:
+            self.assertIn(self.ANCHOR, record)
+
+
+class SharedInstallLineTests(unittest.TestCase):
+    """The lines emitted when a shared install IS found and used."""
+
+    def _fake_shared(self, tmp, install=None, signature_has_fsn=True):
+        """Build a fake /data/bcm tree and a stub package inside it."""
+        pkg = os.path.join(tmp, "src", "bleak_connection_manager")
+        os.makedirs(pkg, exist_ok=True)
+        open(os.path.join(pkg, "__init__.py"), "w").close()
+
+        mod = types.ModuleType("bleak_connection_manager")
+        mod.__file__ = os.path.join(pkg, "__init__.py")
+        if signature_has_fsn:
+            def install_bleak_catcher(owner, adapters=(), link_caps=None,
+                                      wrap_scanner=False,
+                                      tune_conn_params=True,
+                                      force_start_notify=None):
+                if install:
+                    install(owner, adapters=adapters)
+        else:
+            def install_bleak_catcher(owner, adapters=(), link_caps=None,
+                                      wrap_scanner=False,
+                                      tune_conn_params=True):
+                if install:
+                    install(owner, adapters=adapters)
+        mod.install_bleak_catcher = install_bleak_catcher
+        return mod
+
+    def _run(self, tmp, mod, adapters):
+        import catcher_setup as cs
+        importlib.reload(cs)
+        cs.catcher_options = lambda: (adapters, {})
+        cs.shared_dir = lambda: tmp
+        saved = sys.modules.get("bleak_connection_manager")
+        sys.modules["bleak_connection_manager"] = mod   # -> "provided"
+        try:
+            with self.assertLogs(cs.logger, level=logging.INFO) as cm:
+                ok = cs.install_catcher_from_config("test")
+            return ok, "\n".join(cm.output)
+        finally:
+            if saved is None:
+                sys.modules.pop("bleak_connection_manager", None)
+            else:
+                sys.modules["bleak_connection_manager"] = saved
+
+    def test_loaded_from_names_the_package_dir_not_the_config_key(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            mod = self._fake_shared(tmp)
+            ok, blob = self._run(tmp, mod, ["hci1", "AA:BB@hci1"])
+            self.assertTrue(ok)
+            # The package's own directory proves which tree served; the
+            # configured key would not.
+            self.assertIn(
+                "BLE coordination: bleak_connection_manager loaded from "
+                + os.path.join(tmp, "src", "bleak_connection_manager"), blob)
+
+    def test_catcher_installed_line_reports_policy_and_counts(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            mod = self._fake_shared(tmp)
+            ok, blob = self._run(tmp, mod, ["hci1", "AA:BB@hci1"])
+            self.assertTrue(ok)
+            self.assertIn(
+                "BLE coordination: catcher installed (force_start_notify=True, "
+                "adapters=2 configured, 1 pinned)", blob)
+
+    def test_old_install_falls_back_to_the_legacy_env(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            mod = self._fake_shared(tmp, signature_has_fsn=False)
+            os.environ.pop("BCM_FORCE_START_NOTIFY", None)
+            ok, blob = self._run(tmp, mod, ["hci1"])
+            self.assertTrue(ok)
+            self.assertIn("predates the force_start_notify parameter", blob)
+            self.assertEqual(os.environ.get("BCM_FORCE_START_NOTIFY"), "true")
+            os.environ.pop("BCM_FORCE_START_NOTIFY", None)
+
+    def test_catcher_raising_is_distinct_from_a_broken_install(self):
+        import tempfile
+        def boom(owner, adapters=()):
+            raise ValueError("bad kwarg")
+        with tempfile.TemporaryDirectory() as tmp:
+            mod = self._fake_shared(tmp, install=boom)
+            ok, blob = self._run(tmp, mod, ["hci1"])
+            self.assertFalse(ok)
+            # Operator action is "fix the driver", not "fix the install".
+            self.assertIn("BLE coordination: catcher would not install from",
+                          blob)
+            self.assertNotIn("present but unusable", blob)
+
+
+class RunScriptTests(unittest.TestCase):
+    """Pins the launcher template.
+
+    CONSUMERS.md rule 7 is explicit that the box-side check on the file
+    /service/<name> RESOLVES to is the real gate and this test never
+    replaces it. It is still worth having: it stops the shim exec coming
+    back into the repo, and it guards the subtler trap that BCM's
+    installer greps these run scripts for a shim reference in ANY form --
+    so even naming the path in a comment would keep the shim alive on the
+    box after the last real user was gone.
+    """
+
+    def _run_script(self):
+        path = os.path.join(_REPO_ROOT, "service", "run")
+        with open(path) as fh:
+            return fh.read()
+
+    def test_launches_plain_python3(self):
+        self.assertIn("exec softlimit", self._run_script())
+        self.assertIn("python3 -u dbus-easytouchrv.py", self._run_script())
+
+    def test_no_shim_reference_in_any_form(self):
+        import re
+        # The installer's own pattern.
+        pattern = re.compile(r"bcm[^\s\"']*/python3|BCM_PY")
+        for n, line in enumerate(self._run_script().splitlines(), 1):
+            self.assertIsNone(
+                pattern.search(line),
+                "service/run:%d still references the interpreter shim "
+                "(comments count -- the installer greps this file): %r"
+                % (n, line))
 
 
 if __name__ == "__main__":

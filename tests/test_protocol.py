@@ -24,6 +24,7 @@ sys.modules.setdefault("bleak_retry_connector", brc)
 
 bcm = types.ModuleType("bleak_connection_manager")
 bcm.install_bleak_catcher = lambda *a, **k: None
+bcm.__file__ = "/data/bcm/src/bleak_connection_manager/__init__.py"
 vmod = types.ModuleType("bleak_connection_manager.validators")
 async def _stub_ok(client):
     return True

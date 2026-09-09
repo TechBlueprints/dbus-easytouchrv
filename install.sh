@@ -94,7 +94,9 @@ echo ""
 # Step 2b: Converge the shared BCM checkout (fleet-wide BLE stack).
 # Idempotent and forward-only: ff-only means a stale installer can never
 # move the fleet backwards.  Its install.sh smoke-imports the stack and
-# only then updates the /data/bcm/python3 shim the run script prefers.
+# only then is the service restarted.  This installer does not touch the
+# retired interpreter shim: the run script execs plain python3 and the
+# stack is sourced in process (see ble_stack.py).
 echo "Step 2b: Shared bleak-connection-manager install..."
 BCM_DIR=/data/bcm
 if [ -d "$BCM_DIR/.git" ]; then

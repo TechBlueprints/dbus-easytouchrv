@@ -9,10 +9,15 @@ sleep 3
 echo "Starting EasyTouch RV thermostat manager..."
 cd /data/apps/dbus-easytouchrv
 
-# Shared BCM install: the /data/bcm shim serves the fleet-wide BLE stack and
-# marks this a deliberate consumer (BCM_AUTOWIRE=0).  A standalone install
-# without the shared checkout falls back to plain python3, which uses this
-# repo's vendored ext/ stack instead.
-BCM_PY=/data/bcm/python3
-[ -x "$BCM_PY" ] || BCM_PY=python3
-exec softlimit -d 150000000 -s 2000000 -a 150000000 "$BCM_PY" -u dbus-easytouchrv.py
+# Plain python3, deliberately.  The BLE stack is sourced IN PROCESS by
+# ble_stack.ensure_ble_stack(), from the folder config.ini names -- not by
+# an interpreter shim exporting PYTHONPATH.  The launcher no longer decides
+# where the stack comes from, which is the whole point of the fleet
+# consumer contract (bleak-connection-manager CONSUMERS.md sections 2, 7).
+# Do NOT reintroduce an interpreter-shim exec here: it would put that
+# decision back in the launcher and quietly re-enable the environment
+# contract.  The literal shim path is deliberately not written anywhere in
+# this file -- BCM's installer greps these run scripts to decide whether
+# the box still needs the shim, and a mention in a COMMENT counts, so it
+# would keep the shim alive after the last real user was gone.
+exec softlimit -d 150000000 -s 2000000 -a 150000000 python3 -u dbus-easytouchrv.py

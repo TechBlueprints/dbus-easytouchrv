@@ -15,99 +15,129 @@
 
 """Shared bleak-catcher installation for every entry point.
 
-The catcher must be installed before easytouch_ble is imported (that module
-captures bleak.BleakClient / bleak.BleakScanner at import time), so each
-entry point calls install_catcher_from_config() before importing the BLE
-module.  Reading the adapter configuration here keeps the daemon and the
-CLI tools (provision.py, easytouch_device.py) routing identically: an
-`adapters = hci1` allowlist written for the service also steers a hand-run
-scan off a dead onboard adapter.
+Implements the fleet consumer contract (bleak-connection-manager's
+CONSUMERS.md).  Two things follow from it and are easy to undo by accident:
 
-BLE stack resolution: bleak-connection-manager is NEVER vendored here.  It
-is installed once per box at /data/bcm (install.sh step 2b) and shared by
-every consumer; the service/run script execs its interpreter shim
-(/data/bcm/python3), which serves bleak, bleak-retry-connector,
-bleak-connection-manager, dbus-fast and friends.  This repo vendors only
-the rest of the stack, as a fallback for a box that has no /data/bcm.
+  * The BCM location is CONFIGURATION, not launch environment.  One key,
+    bluetooth_connection_manager_dir (default /data/bcm, empty = never
+    look).  Nothing about how the process was started decides where the
+    stack comes from -- no interpreter shim, no PYTHONPATH, no env var.
+    The run script therefore execs a plain python3.
+  * ensure_ble_stack() is called UNCONDITIONALLY and FIRST, before
+    anything imports bleak.  Two reasons: easytouch_ble captures
+    BleakClient/BleakScanner at import time, and the sitewide autowire
+    hook stands down only for a process that already has
+    bleak_connection_manager in sys.modules.  A late call means autowire
+    installs a generic catcher with a cmdline-derived owner and no pins.
 
-Consequence on Venus specifically: /data/bcm is also where dbus-fast 5
-comes from, and Venus ships 2.21.1 while bleak needs >= 4.  So on Venus
-the fallback cannot satisfy bleak either, and install.sh is required
-rather than merely recommended.  _ensure_ble_stack() says so plainly
-instead of letting it surface as an ImportError deep inside bleak.
+Reading the adapter configuration here also keeps the daemon and the CLI
+tools (provision.py, easytouch_device.py) routing identically: an
+`adapters` allowlist written for the service also steers a hand-run scan
+off a dead onboard adapter.
+
+BCM itself is never vendored (CONSUMERS.md section 3).  This repo vendors
+only bleak, bleak-retry-connector, bluetooth-adapters and aiooui, and
+those roots are inserted ONLY once ble_stack has reported "vendored".
+On that path nothing is imported from bleak_connection_manager and no
+BCM-only adapter syntax (MAC@hciX, MAC-keyed pins) reaches plain bleak --
+the routing is simply not applied, and said so at startup.
+
+Venus note: /data/bcm is also where dbus-fast 5 comes from, and Venus
+ships 2.21.1 while bleak needs >= 4.  So on Venus the vendored fallback
+cannot satisfy bleak either and install.sh is required, not optional;
+_warn_if_dbus_fast_too_old() says so rather than letting it surface as an
+ImportError inside dbus_fast.
 """
 
 from __future__ import annotations
 
 import configparser
+import inspect
 import logging
 import os
 import sys
 
+import ble_stack
+from ble_stack import ensure_ble_stack
+
 logger = logging.getLogger(__name__)
+
+# The shared install gained force_start_notify= at 159536a (2026-09-02).
+_LEGACY_START_NOTIFY_ENV = "BCM_FORCE_START_NOTIFY"
+
+_CONFIG_NAMES = ("config.ini", "config.default.ini")
+
+
+def _config() -> configparser.SectionProxy | dict:
+    cfg = configparser.ConfigParser()
+    config_dir = os.path.dirname(os.path.abspath(__file__))
+    for name in _CONFIG_NAMES:
+        path = os.path.join(config_dir, name)
+        if os.path.exists(path):
+            cfg.read(path)
+            break
+    return cfg["DEFAULT"] if "DEFAULT" in cfg else {}
+
+
+def _bool(value: str, default: bool) -> bool:
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def shared_dir() -> str:
+    """Configured BCM location.  Empty string means never look."""
+    raw = _config().get("bluetooth_connection_manager_dir", "/data/bcm")
+    return str(raw).strip()
+
+
+def force_start_notify() -> bool:
+    """Per-process StartNotify policy, passed to install_bleak_catcher."""
+    return _bool(
+        _config().get(
+            "bluetooth_connection_manager_force_start_notify", "true"),
+        True)
+
+
+def _vendored_roots() -> list[str]:
+    """This repo's standalone BLE stack.  Deliberately NOT a BCM copy."""
+    ext = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
+    return [
+        os.path.join(ext, "bleak-retry-connector", "src"),
+        os.path.join(ext, "bluetooth-adapters", "src"),
+        os.path.join(ext, "aiooui", "src"),
+        os.path.join(ext, "bleak"),
+    ]
 
 
 def _warn_if_dbus_fast_too_old() -> None:
-    """Say plainly when the fallback cannot actually satisfy bleak.
+    """Say plainly when the vendored fallback cannot actually satisfy bleak.
 
     bleak needs dbus-fast >= 4; Venus ships 2.21.1, whose package has no
-    ``annotations`` module.  /data/bcm is what supplies a new enough copy,
-    so without it the very next import of bleak dies somewhere inside
-    dbus_fast with nothing pointing at the cause.  One line here costs
-    nothing and turns that into an actionable message.
+    ``annotations`` module.  Without /data/bcm the next import of bleak
+    dies inside dbus_fast with nothing pointing at the cause.
     """
     try:
         import importlib.util
         if importlib.util.find_spec("dbus_fast") is None:
-            return                      # not Linux/BlueZ, or no dbus stack
+            return                      # no dbus stack at all; not our case
         if importlib.util.find_spec("dbus_fast.annotations") is not None:
             return                      # new enough
     except (ImportError, ValueError):
         return
     logger.error(
         "dbus-fast is too old for bleak (no dbus_fast.annotations; bleak "
-        "needs >= 4, Venus ships 2.21.1). The shared install at /data/bcm "
-        "supplies a current one -- run install.sh. Importing bleak will "
-        "fail until then.")
-
-
-def _ensure_ble_stack() -> None:
-    """Put the vendored ext/ BLE stack on sys.path unless already provided
-    (by the shared /data/bcm shim, or by test stubs).
-
-    bleak-connection-manager is deliberately NOT among the vendored
-    entries: it lives at /data/bcm and nowhere else (see module docstring).
-    """
-    if "bleak_connection_manager" in sys.modules:
-        return
-    try:
-        import importlib.util
-        if importlib.util.find_spec("bleak_connection_manager") is not None:
-            return
-    except (ImportError, ValueError):
-        pass
-    _ext = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
-    for _sub in [
-        os.path.join(_ext, "bleak-retry-connector", "src"),
-        os.path.join(_ext, "bluetooth-adapters", "src"),
-        os.path.join(_ext, "aiooui", "src"),
-        os.path.join(_ext, "bleak"),
-    ]:
-        if os.path.isdir(_sub) and _sub not in sys.path:
-            sys.path.insert(0, _sub)
-    _warn_if_dbus_fast_too_old()
+        "needs >= 4, Venus ships 2.21.1). The shared install supplies a "
+        "current one -- run install.sh. Importing bleak will fail until "
+        "then.")
 
 
 def catcher_options() -> tuple[list[str], dict[str, int]]:
     """Adapter entries and link caps for the bleak catcher, from config.ini."""
-    cfg = configparser.ConfigParser()
-    config_dir = os.path.dirname(os.path.abspath(__file__))
-    for name in ("config.ini", "config.default.ini"):
-        path = os.path.join(config_dir, name)
-        if os.path.exists(path):
-            cfg.read(path)
-            break
-    defaults = cfg["DEFAULT"] if "DEFAULT" in cfg else {}
+    defaults = _config()
     # Raw entries, passed to the catcher verbatim: "MAC@hciX" pins a device
     # to an adapter, plain "hciX" entries form the shared pool.  Empty means
     # every adapter the kernel exposes is a candidate.
@@ -133,57 +163,110 @@ def _tune_conn_params() -> bool:
     link on any marginal RF moment.  Enable with `tune_conn_params = true`
     in config.ini if a deployment wants it.
     """
-    cfg = configparser.ConfigParser()
-    config_dir = os.path.dirname(os.path.abspath(__file__))
-    for name in ("config.ini", "config.default.ini"):
-        path = os.path.join(config_dir, name)
-        if os.path.exists(path):
-            cfg.read(path)
-            break
-    defaults = cfg["DEFAULT"] if "DEFAULT" in cfg else {}
-    return str(defaults.get("tune_conn_params", "false")).strip().lower() in (
-        "1", "true", "yes", "on")
+    return _bool(_config().get("tune_conn_params", "false"), False)
+
+
+def _report_uncoordinated(directory: str) -> None:
+    """The vendored path: insert our own roots and say what is lost.
+
+    Silence here would be the worst outcome: a configured `adapters` pin
+    reads as honoured while BlueZ picks the card.
+    """
+    logger.warning(
+        "BLE coordination: no shared install at %s; running uncoordinated, "
+        "no claims, no adapter routing, no card recovery", directory)
+    for root in _vendored_roots():
+        if os.path.isdir(root) and root not in sys.path:
+            sys.path.insert(1, root)
+    _warn_if_dbus_fast_too_old()
+    adapters, link_caps = catcher_options()
+    if adapters:
+        logger.warning(
+            "adapters = %s is NOT being applied without the shared install",
+            " ".join(adapters))
+    if link_caps:
+        logger.warning(
+            "link_caps = %s is NOT being applied without the shared install",
+            " ".join("%s:%d" % kv for kv in sorted(link_caps.items())))
 
 
 def install_catcher_from_config(owner: str) -> bool:
-    """Install the bleak catcher with the configured adapter routing.
+    """Source the shared BCM install and install the catcher.
 
-    Returns whether the catcher was installed.  BCM is optional: a checkout
-    cloned without --recursive, or a box with only bleak and
-    bleak-retry-connector, still runs.  What is lost is stated plainly at
-    startup rather than failing the service, because the driver's own
-    retry/backoff and post-connect validation (easytouch_ble) do not depend
-    on it -- only the multi-adapter routing does.
+    Returns whether the catcher was installed.  Every failure is a warning
+    or an error and never an exception: the driver runs uncoordinated on
+    plain bleak-retry-connector rather than not at all.
     """
-    _ensure_ble_stack()
-    try:
-        from bleak_connection_manager import install_bleak_catcher
-    except ImportError as exc:
-        adapters, link_caps = catcher_options()
-        logger.warning(
-            "bleak-connection-manager not available (%s); running on plain "
-            "bleak-retry-connector. Lost: claim-aware adapter selection, "
-            "cross-process link coordination, per-adapter link caps, and "
-            "connection-parameter tuning. BlueZ picks the adapter.", exc)
-        # Silence is the wrong answer when the operator configured routing
-        # that is now being ignored: an "MAC@hciX" pin reads as honoured.
-        if adapters:
-            logger.warning(
-                "adapters = %s is NOT being applied without "
-                "bleak-connection-manager", " ".join(adapters))
-        if link_caps:
-            logger.warning(
-                "link_caps = %s is NOT being applied without "
-                "bleak-connection-manager",
-                " ".join("%s:%d" % kv for kv in sorted(link_caps.items())))
+    directory = shared_dir()
+    state = ensure_ble_stack(shared_dir=directory, vendored_dir=None)
+
+    if state == "vendored":
+        # ble_stack withdraws every path and module a broken install
+        # contributed before returning, so this is safe either way.  The
+        # two cases are different operator actions and never logged alike.
+        # shared_failure is set on the module by ensure_ble_stack, so it
+        # must be read off the module object, not bound at import time.
+        if ble_stack.shared_failure:
+            logger.error(
+                "BLE coordination: shared install at %s is present but "
+                "unusable, running uncoordinated: %s",
+                directory, ble_stack.shared_failure)
+            for root in _vendored_roots():
+                if os.path.isdir(root) and root not in sys.path:
+                    sys.path.insert(1, root)
+            _warn_if_dbus_fast_too_old()
+        else:
+            _report_uncoordinated(directory)
         return False
 
+    import bleak_connection_manager
+    from bleak_connection_manager import install_bleak_catcher
+
+    # The package's OWN directory, not the configured key: this line has to
+    # prove which tree actually served.  A namespace package has no
+    # __file__, so fall back rather than dying on the diagnostic.
+    package_file = getattr(bleak_connection_manager, "__file__", None)
+    loaded_from = (os.path.dirname(os.path.abspath(package_file))
+                   if package_file
+                   else os.path.join(directory, "src",
+                                     "bleak_connection_manager"))
+    logger.info(
+        "BLE coordination: bleak_connection_manager loaded from %s",
+        loaded_from)
+
     adapters, link_caps = catcher_options()
-    install_bleak_catcher(
-        owner,
-        adapters=adapters,
-        link_caps=link_caps,
-        wrap_scanner=True,
-        tune_conn_params=_tune_conn_params(),
-    )
+    notify = force_start_notify()
+    kwargs = dict(adapters=adapters, link_caps=link_caps, wrap_scanner=True,
+                  tune_conn_params=_tune_conn_params())
+    try:
+        supported = "force_start_notify" in inspect.signature(
+            install_bleak_catcher).parameters
+    except (TypeError, ValueError):
+        supported = False
+    if supported:
+        kwargs["force_start_notify"] = notify
+    else:
+        # Pre-159536a install: the parameter does not exist yet, so the
+        # policy can only travel through the legacy environment read.
+        os.environ[_LEGACY_START_NOTIFY_ENV] = "true" if notify else "false"
+        logger.warning(
+            "BLE coordination: shared install at %s predates the "
+            "force_start_notify parameter; StartNotify policy passed "
+            "through the legacy BCM_FORCE_START_NOTIFY environment",
+            directory)
+
+    try:
+        install_bleak_catcher(owner, **kwargs)
+    except Exception as exc:
+        # Distinct from "present but unusable": the install is fine, the
+        # driver or the catcher is not, and that is a different fix.
+        logger.error(
+            "BLE coordination: catcher would not install from %s, running "
+            "uncoordinated: %r", directory, exc)
+        return False
+
+    logger.info(
+        "BLE coordination: catcher installed (force_start_notify=%s, "
+        "adapters=%d configured, %d pinned)",
+        notify, len(adapters), sum(1 for a in adapters if "@" in a))
     return True
