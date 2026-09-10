@@ -130,6 +130,17 @@ _LINK_GONE_MARKERS = (
     "is not registered",
     "disconnected",
     "no reply",
+    # bleak raises this from BleakClient.services when the backend's service
+    # table is empty, which disconnect()'s _cleanup_all() is what empties.
+    # So it is a fact about the client object, not a cached property: unlike
+    # is_connected -- which this driver deliberately does not trust, because
+    # BlueZ can strand it False after an adapter reset while GATT still
+    # works -- there is no path back from an empty service table on the same
+    # client.  Without this marker a post-disconnect poll was merely
+    # "unanswered", so the monitor spent three writes and 30s of tracebacks
+    # discovering what the disconnect event had already said (prod, AC Front,
+    # 2026-09-09 23:11:00-23:11:29Z).
+    "service discovery has not been performed",
 )
 
 

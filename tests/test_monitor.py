@@ -499,8 +499,40 @@ class LinkGoneTests(unittest.TestCase):
         for exc in (OSError(9, "Bad file descriptor"),
                     KeyError("152 is not registered"),
                     Exception("[org.bluez.Error.Failed] Not connected"),
-                    Exception("Disconnected early")):
+                    Exception("Disconnected early"),
+                    # bleak, from BleakClient.services once the backend's
+                    # service table is empty -- which is what disconnect()
+                    # empties.  A fact about the client, not a cached
+                    # property, so there is no way back on this client.
+                    Exception("Service Discovery has not been performed yet")):
             self.assertTrue(et._is_link_gone(exc), exc)
+
+    def test_post_disconnect_write_ends_the_session_on_the_first_try(self):
+        """One failed write, not three.
+
+        Prod 2026-09-09: AC Front disconnected at 23:11:00Z and the monitor
+        wrote into the dead client at :09, :19 and :29 -- three full
+        tracebacks over 30s -- before "3 consecutive unanswered status
+        requests" concluded what the disconnect had already established.
+        Classifying bleak's post-disconnect error as link-gone is what
+        collapses that to one line and an immediate reconnect.
+        """
+        writes = []
+
+        class DeadClient:
+            mtu_size = 23
+
+            async def write_gatt_char(self, uuid, payload, response=False):
+                writes.append(payload)
+                raise Exception("Service Discovery has not been performed yet")
+
+            async def disconnect(self):
+                pass
+
+        s = self._session_with_client(DeadClient())
+        with self.assertRaises(ConnectionError):
+            self.run_async(s._exchange({"Type": "Get Status"}))
+        self.assertEqual(len(writes), 1, "wrote into a dead client more than once")
 
     def test_keeps_ordinary_errors_retryable(self):
         for exc in (ValueError("bad payload"),
